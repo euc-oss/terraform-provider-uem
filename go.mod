@@ -3,7 +3,7 @@ module github.com/euc-oss/terraform-provider-uem
 go 1.25.9
 
 require (
-	github.com/euc-oss/terraform-sdk-uem v0.0.2-smoke.1
+	github.com/euc-oss/terraform-sdk-uem v0.0.2
 	github.com/hashicorp/terraform-plugin-framework v1.16.1
 	github.com/hashicorp/terraform-plugin-log v0.9.0
 )
