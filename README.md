@@ -1,8 +1,7 @@
 # Terraform Provider for Omnissa Workspace ONE UEM
 
-[License](LICENSE)
-[Tests](https://github.com/euc-oss/terraform-provider-uem/actions)
-Status: Tech Preview
+[![Lint Status](https://github.com/euc-oss/terraform-provider-uem/workflows/Linter/badge.svg)](https://github.com/euc-oss/terraform-provider-uem/actions)
+![Status: Tech Preview](https://img.shields.io/badge/status-tech%20preview-0078D4)
 
 > [!WARNING] This provider is in tech preview. Please ensure flows are thoroughly test before using against a production environment.
 
