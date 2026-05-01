@@ -1,0 +1,341 @@
+package models
+
+import "github.com/hashicorp/terraform-plugin-framework/types"
+
+type ProfileResourceModel struct {
+	ID                  types.String              `tfsdk:"id"`
+	Name                types.String              `tfsdk:"name"`
+	Description         types.String              `tfsdk:"description"`
+	Platform            types.String              `tfsdk:"platform"`
+	OrgGroupID          types.String              `tfsdk:"org_group_id"`
+	AssignmentType      types.String              `tfsdk:"assignment_type"`
+	ProfileScope        types.String              `tfsdk:"profile_scope"`
+	IsActive            types.Bool                `tfsdk:"is_active"`
+	LockScreenMessage   types.String              `tfsdk:"lock_screen_message"`
+	Passcode            *PasscodeModel            `tfsdk:"passcode"`
+	CustomSettingsList  []CustomSettingsItemModel `tfsdk:"custom_settings_list"`
+	NetworkList         []NetworkItemModel        `tfsdk:"network_list"`
+	CredentialsList     []CredentialItemModel     `tfsdk:"credentials_list"`
+	DiskEncryption      *DiskEncryptionModel      `tfsdk:"disk_encryption"`
+	Gatekeeper          *GatekeeperModel          `tfsdk:"gatekeeper"`
+	Restrictions        *RestrictionsModel        `tfsdk:"restrictions"`
+	UUID                types.String              `tfsdk:"uuid"`
+	ProfileContext      types.String              `tfsdk:"profile_context"`
+	AssignedSmartGroups []types.String            `tfsdk:"assigned_smart_groups"`
+	ExcludedSmartGroups []types.String            `tfsdk:"excluded_smart_groups"`
+}
+
+type CustomSettingsItemModel struct {
+	CustomSettings types.String `tfsdk:"custom_settings"`
+}
+
+type NetworkItemModel struct {
+	NetworkInterface                   types.String `tfsdk:"network_interface"`
+	ServiceSetIdentifier               types.String `tfsdk:"service_set_identifier"`
+	HiddenNetwork                      types.Bool   `tfsdk:"hidden_network"`
+	AutoJoin                           types.Bool   `tfsdk:"auto_join"`
+	SecurityType                       types.String `tfsdk:"security_type"`
+	Password                           types.String `tfsdk:"password"`
+	UseAsLoginWindowConfiguration      types.Bool   `tfsdk:"use_as_login_window_configuration"`
+	UseDirectoryAuthentication         types.Bool   `tfsdk:"use_directory_authentication"`
+	TLS                                types.Bool   `tfsdk:"tls"`
+	TTLS                               types.Bool   `tfsdk:"ttls"`
+	LEAP                               types.Bool   `tfsdk:"leap"`
+	PEAP                               types.Bool   `tfsdk:"peap"`
+	EAPFAST                            types.Bool   `tfsdk:"eap_fast"`
+	EAPSIM                             types.Bool   `tfsdk:"eap_sim"`
+	EAPAKA                             types.Bool   `tfsdk:"eap_aka"`
+	TLSMinimumVersion                  types.String `tfsdk:"tls_minimum_version"`
+	TLSMaximumVersion                  types.String `tfsdk:"tls_maximum_version"`
+	DisableAssociationMACRandomization types.Bool   `tfsdk:"disable_association_mac_randomization"`
+	UserName                           types.String `tfsdk:"user_name"`
+	UserPassword                       types.String `tfsdk:"user_password"`
+	IdentityCertificate                types.String `tfsdk:"identity_certificate"`
+	InnerIdentity                      types.String `tfsdk:"inner_identity"`
+	OuterIdentity                      types.String `tfsdk:"outer_identity"`
+	UsePAC                             types.Bool   `tfsdk:"use_pac"`
+	AllowTwoRANDs                      types.Bool   `tfsdk:"allow_two_rands"`
+	TrustedCertificates                types.List   `tfsdk:"trusted_certificates"`
+	AllowTrustExceptions               types.Bool   `tfsdk:"allow_trust_exceptions"`
+	ProxyType                          types.String `tfsdk:"proxy_type"`
+	ProxyServer                        types.String `tfsdk:"proxy_server"`
+	ProxyServerPort                    types.Int64  `tfsdk:"proxy_server_port"`
+	ProxyUsername                      types.String `tfsdk:"proxy_username"`
+	ProxyPassword                      types.String `tfsdk:"proxy_password"`
+	ProxyUrl                           types.String `tfsdk:"proxy_url"`
+	PacFallback                        types.Bool   `tfsdk:"pac_fallback"`
+}
+
+type CredentialItemModel struct {
+	CredentialSource             types.String `tfsdk:"credential_source"`
+	CredentialName               types.String `tfsdk:"credential_name"`
+	CertificatePayload           types.String `tfsdk:"certificate_payload"`
+	CertificatePassword          types.String `tfsdk:"certificate_password"`
+	CertificateID                types.Int64  `tfsdk:"certificate_id"`
+	CertificateAuthority         types.Int64  `tfsdk:"certificate_authority"`
+	CertificateTemplate          types.Int64  `tfsdk:"certificate_template"`
+	AllowAccessToAllApplications types.Bool   `tfsdk:"allow_access_to_all_applications"`
+	KeyIsExtractable             types.Bool   `tfsdk:"key_is_extractable"`
+}
+
+type PasscodeModel struct {
+	RequirePasscodeOnDevice          types.Bool   `tfsdk:"require_passcode_on_device"`
+	AllowSimpleValue                 types.Bool   `tfsdk:"allow_simple_value"`
+	RequireAlphanumericValue         types.Bool   `tfsdk:"require_alphanumeric_value"`
+	MinimumPasscodeLength            types.Int64  `tfsdk:"minimum_passcode_length"`
+	MinimumNumberOfComplexCharacters types.String `tfsdk:"minimum_number_of_complex_characters"`
+	MaximumPasscodeAge               types.String `tfsdk:"maximum_passcode_age"`
+	AutoLock                         types.String `tfsdk:"auto_lock"`
+	GracePeriod                      types.Int64  `tfsdk:"grace_period"`
+	MaxFailedAttempts                types.String `tfsdk:"max_failed_attempts"`
+	PinHistory                       types.String `tfsdk:"pin_history"`
+	MinutesUntilFailedLoginReset     types.Int64  `tfsdk:"minutes_until_failed_login_reset"`
+}
+
+type DiskEncryptionModel struct {
+	AirWatch  *DiskEncryptionAirWatchModel  `tfsdk:"airwatch"`
+	FileVault *DiskEncryptionFileVaultModel `tfsdk:"filevault2"`
+	MCX       *DiskEncryptionMCXModel       `tfsdk:"mcx"`
+}
+
+type DiskEncryptionAirWatchModel struct {
+	StoreKey                                    types.Bool   `tfsdk:"store_key"`
+	RotateKeyAfter                              types.Int64  `tfsdk:"rotate_key_after"`
+	UseIntelligentHub                           types.Bool   `tfsdk:"use_intelligent_hub"`
+	NotifyUserForEncryption                     types.Bool   `tfsdk:"notify_user_for_encryption"`
+	EncryptionNotificationTitle                 types.String `tfsdk:"encryption_notification_title"`
+	EncryptionNotificationMessage               types.String `tfsdk:"encryption_notification_message"`
+	EncryptionMaxNotifyAttempts                 types.Int64  `tfsdk:"encryption_max_notify_attempts"`
+	EncryptionNotificationRetryIntervalInHours  types.Int64  `tfsdk:"encryption_notification_retry_interval_in_hours"`
+	EncryptionActionAfterLastNotification       types.Int64  `tfsdk:"encryption_action_after_last_notification"`
+	EnableRecoveryKey                           types.Bool   `tfsdk:"enable_recovery_key"`
+	RecoveryKeyNotificationTitle                types.String `tfsdk:"recovery_key_notification_title"`
+	RecoveryKeyNotificationMessage              types.String `tfsdk:"recovery_key_notification_message"`
+	RecoveryKeyNotificationRetryIntervalInHours types.Int64  `tfsdk:"recovery_key_notification_retry_interval_in_hours"`
+	RecoveryKeyPromptTitle                      types.String `tfsdk:"recovery_key_prompt_title"`
+	RecoveryKeyPromptMessage                    types.String `tfsdk:"recovery_key_prompt_message"`
+	RecoveryKeySuccessTitle                     types.String `tfsdk:"recovery_key_success_title"`
+	RecoveryKeySuccessMessage                   types.String `tfsdk:"recovery_key_success_message"`
+	RecoveryKeyErrorTitle                       types.String `tfsdk:"recovery_key_error_title"`
+	RecoveryKeyErrorMessage                     types.String `tfsdk:"recovery_key_error_message"`
+	RecoveryKeyMaxFailureCount                  types.Int64  `tfsdk:"recovery_key_max_failure_count"`
+}
+
+type DiskEncryptionFileVaultModel struct {
+	Enable                         types.Bool   `tfsdk:"enable"`
+	ShowRecoveryKey                types.Bool   `tfsdk:"show_recovery_key"`
+	RecoveryType                   types.Int64  `tfsdk:"recovery_type"`
+	FileVaultEnterpriseCertificate types.String `tfsdk:"filevault_enterprise_certificate"`
+	FileVaultUser                  types.Int64  `tfsdk:"filevault_user"`
+	Username                       types.String `tfsdk:"username"`
+	PromptToEnableFileVaultAt      types.Int64  `tfsdk:"prompt_to_enable_filevault_at"`
+	NumberOfTimesUserCanBypass     types.Int64  `tfsdk:"number_of_times_user_can_bypass"`
+}
+
+type DiskEncryptionMCXModel struct {
+	DestroyFVKeyOnStandby types.Bool `tfsdk:"destroy_fv_key_on_standby"`
+}
+
+// GatekeeperModel maps to MacOsGatekeeperPayloadV2Entity, surfaced in the UEM
+// console as "Security & Privacy". The seven fields cover auto-unlock, Touch
+// ID, Handoff, screen capture, and software-update deferral.
+type GatekeeperModel struct {
+	AllowAutoUnlock              types.Bool  `tfsdk:"allow_auto_unlock"`
+	AllowFingerprintForUnlock    types.Bool  `tfsdk:"allow_fingerprint_for_unlock"`
+	AllowHandoff                 types.Bool  `tfsdk:"allow_handoff"`
+	AllowScreenCapture           types.Bool  `tfsdk:"allow_screen_capture"`
+	EnableAppSoftwareUpdateDelay types.Bool  `tfsdk:"enable_app_software_update_delay"`
+	EnableSoftwareUpdateDelay    types.Bool  `tfsdk:"enable_software_update_delay"`
+	EnforcedSoftwareUpdateDelay  types.Int64 `tfsdk:"enforced_software_update_delay"`
+}
+
+type RestrictionsModel struct {
+	Applications  *RestrictionsApplicationsModel  `tfsdk:"applications"`
+	Desktop       *RestrictionsDesktopModel       `tfsdk:"desktop"`
+	Functionality *RestrictionsFunctionalityModel `tfsdk:"functionality"`
+	Media         *RestrictionsMediaModel         `tfsdk:"media"`
+	Preferences   *RestrictionsPreferencesModel   `tfsdk:"preferences"`
+	Sharing       *RestrictionsSharingModel       `tfsdk:"sharing"`
+	Widgets       *RestrictionsWidgetsModel       `tfsdk:"widgets"`
+}
+
+type RestrictionsApplicationsModel struct {
+	AllowApplication                            types.List                   `tfsdk:"allow_application"`
+	AllowFolders                                types.List                   `tfsdk:"allow_folders"`
+	DisallowFolders                             types.List                   `tfsdk:"disallow_folders"`
+	RestrictWhichApplicationsAreAllowedToLaunch types.Bool                   `tfsdk:"restrict_which_applications_are_allowed_to_launch"`
+	AppStore                                    *RestrictionsAppStoreModel   `tfsdk:"app_store"`
+	AppleMusic                                  *RestrictionsAppleMusicModel `tfsdk:"apple_music"`
+	Camera                                      *RestrictionsCameraModel     `tfsdk:"camera"`
+	GameCentre                                  *RestrictionsGameCentreModel `tfsdk:"game_centre"`
+	Safari                                      *RestrictionsSafariModel     `tfsdk:"safari"`
+}
+
+type RestrictionsAppStoreModel struct {
+	AllowAppStoreAppAdoption                 types.Bool `tfsdk:"allow_app_store_app_adoption"`
+	RequireAdminPasswordToInstallOrUpdateApp types.Bool `tfsdk:"require_admin_password_to_install_or_update_app"`
+	RestrictAppStoreToSoftwareUpdatesOnly    types.Bool `tfsdk:"restrict_app_store_to_software_updates_only"`
+}
+
+type RestrictionsAppleMusicModel struct {
+	AllowMusicService types.Bool `tfsdk:"allow_music_service"`
+}
+
+type RestrictionsCameraModel struct {
+	AllowUseOfBuiltInCamera types.Bool `tfsdk:"allow_use_of_built_in_camera"`
+}
+
+type RestrictionsGameCentreModel struct {
+	AllowAddingGameCenterFriends types.Bool `tfsdk:"allow_adding_game_center_friends"`
+	AllowGameCenterModification  types.Bool `tfsdk:"allow_game_center_modification"`
+	AllowMultiplayerGaming       types.Bool `tfsdk:"allow_multiplayer_gaming"`
+	AllowUseOfGameCenter         types.Bool `tfsdk:"allow_use_of_game_center"`
+}
+
+type RestrictionsSafariModel struct {
+	AllowDeprecatedWebKitTls types.Bool `tfsdk:"allow_deprecated_web_kit_tls"`
+	AllowSafariAutoFill      types.Bool `tfsdk:"allow_safari_auto_fill"`
+}
+
+type RestrictionsDesktopModel struct {
+	DesktopPicturePath types.String `tfsdk:"desktop_picture_path"`
+	LockDesktopPicture types.Bool   `tfsdk:"lock_desktop_picture"`
+}
+
+type RestrictionsFunctionalityModel struct {
+	AirPrint       *RestrictionsAirPrintModel       `tfsdk:"air_print"`
+	ContentCaching *RestrictionsContentCachingModel `tfsdk:"content_caching"`
+	ICloud         *RestrictionsICloudModel         `tfsdk:"icloud"`
+	Passwords      *RestrictionsPasswordsModel      `tfsdk:"passwords"`
+	Spotlight      *RestrictionsSpotlightModel      `tfsdk:"spotlight"`
+}
+
+type RestrictionsAirPrintModel struct {
+	AllowAirPrint                      types.Bool `tfsdk:"allow_air_print"`
+	AllowAirPrintiBeaconDiscovery      types.Bool `tfsdk:"allow_air_print_ibeacon_discovery"`
+	ForceAirPrintTrustedTLSRequirement types.Bool `tfsdk:"force_air_print_trusted_tls_requirement"`
+}
+
+type RestrictionsContentCachingModel struct {
+	AllowContentCaching types.Bool `tfsdk:"allow_content_caching"`
+}
+
+type RestrictionsICloudModel struct {
+	AllowAirPrint                          types.Bool `tfsdk:"allow_air_print"`
+	AllowAirPrintiBeaconDiscovery          types.Bool `tfsdk:"allow_air_print_ibeacon_discovery"`
+	AllowCloudDesktopAndDocuments          types.Bool `tfsdk:"allow_cloud_desktop_and_documents"`
+	AllowDeprecatedWebKitTls               types.Bool `tfsdk:"allow_deprecated_web_kit_tls"`
+	AllowICloudFMM                         types.Bool `tfsdk:"allow_icloud_fmm"`
+	AllowIcloudAddressBook                 types.Bool `tfsdk:"allow_icloud_address_book"`
+	AllowIcloudBTMM                        types.Bool `tfsdk:"allow_icloud_btmm"`
+	AllowIcloudBookmarks                   types.Bool `tfsdk:"allow_icloud_bookmarks"`
+	AllowIcloudCalendar                    types.Bool `tfsdk:"allow_icloud_calendar"`
+	AllowIcloudDocumentsAndData            types.Bool `tfsdk:"allow_icloud_documents_and_data"`
+	AllowIcloudKeychainSync                types.Bool `tfsdk:"allow_icloud_keychain_sync"`
+	AllowIcloudMail                        types.Bool `tfsdk:"allow_icloud_mail"`
+	AllowIcloudNotes                       types.Bool `tfsdk:"allow_icloud_notes"`
+	AllowIcloudReminders                   types.Bool `tfsdk:"allow_icloud_reminders"`
+	AllowPasswordAutoFill                  types.Bool `tfsdk:"allow_password_auto_fill"`
+	AllowPasswordProximityRequests         types.Bool `tfsdk:"allow_password_proximity_requests"`
+	AllowPasswordSharing                   types.Bool `tfsdk:"allow_password_sharing"`
+	AllowUseIcloudPasswordForLocalAccounts types.Bool `tfsdk:"allow_use_icloud_password_for_local_accounts"`
+	ForceAirPrintTrustedTLSRequirement     types.Bool `tfsdk:"force_air_print_trusted_tls_requirement"`
+}
+
+type RestrictionsPasswordsModel struct {
+	AllowPasswordAutoFill          types.Bool `tfsdk:"allow_password_auto_fill"`
+	AllowPasswordProximityRequests types.Bool `tfsdk:"allow_password_proximity_requests"`
+	AllowPasswordSharing           types.Bool `tfsdk:"allow_password_sharing"`
+}
+
+type RestrictionsSpotlightModel struct {
+	AllowSpotlightSuggestions types.Bool `tfsdk:"allow_spotlight_suggestions"`
+}
+
+type RestrictionsMediaModel struct {
+	AutoEjectMedia              types.Bool                      `tfsdk:"auto_eject_media"`
+	DiskMediaCDs                *RestrictionsMediaAccessModel   `tfsdk:"disk_media_cds"`
+	DiskMediaDVDs               *RestrictionsMediaAccessModel   `tfsdk:"disk_media_dvds"`
+	ExternalHardDiskMediaAccess *RestrictionsMediaAccessModel   `tfsdk:"external_hard_disk_media_access"`
+	HardDiskDvdRam              *RestrictionsMediaAccessModel   `tfsdk:"hard_disk_dvd_ram"`
+	HardDiskImages              *RestrictionsMediaAccessModel   `tfsdk:"hard_disk_images"`
+	InternalHardDiskMediaAccess *RestrictionsMediaAccessModel   `tfsdk:"internal_hard_disk_media_access"`
+	NetworkAccess               *RestrictionsNetworkAccessModel `tfsdk:"network_access"`
+	RecordableDisc              *RestrictionsBurnSupportModel   `tfsdk:"recordable_disc"`
+}
+
+type RestrictionsMediaAccessModel struct {
+	Allow        types.Bool `tfsdk:"allow"`
+	Authenticate types.Bool `tfsdk:"authenticate"`
+	ReadOnly     types.Bool `tfsdk:"read_only"`
+}
+
+type RestrictionsNetworkAccessModel struct {
+	AirDrop types.Bool `tfsdk:"air_drop"`
+}
+
+type RestrictionsBurnSupportModel struct {
+	BurnSupport *RestrictionsMediaAccessModel `tfsdk:"burn_support"`
+}
+
+type RestrictionsPreferencesModel struct {
+	Accessibility          types.Bool   `tfsdk:"accessibility"`
+	AppStore               types.Bool   `tfsdk:"app_store"`
+	Bluetooth              types.Bool   `tfsdk:"bluetooth"`
+	CDsAndDVDs             types.Bool   `tfsdk:"cds_and_dvds"`
+	DateAndTime            types.Bool   `tfsdk:"date_and_time"`
+	DesktopAndScreenSaver  types.Bool   `tfsdk:"desktop_and_screen_saver"`
+	DictationAndSpeech     types.Bool   `tfsdk:"dictation_and_speech"`
+	Displays               types.Bool   `tfsdk:"displays"`
+	Dock                   types.Bool   `tfsdk:"dock"`
+	EnabledPreferencePanes types.Bool   `tfsdk:"enabled_preference_panes"`
+	EnergySaver            types.Bool   `tfsdk:"energy_saver"`
+	Extensions             types.Bool   `tfsdk:"extensions"`
+	FibreChannel           types.Bool   `tfsdk:"fibre_channel"`
+	FlashPlayer            types.Bool   `tfsdk:"flash_player"`
+	General                types.Bool   `tfsdk:"general"`
+	Ink                    types.Bool   `tfsdk:"ink"`
+	InternetAccounts       types.Bool   `tfsdk:"internet_accounts"`
+	Keyboard               types.Bool   `tfsdk:"keyboard"`
+	LanguageAndText        types.Bool   `tfsdk:"language_and_text"`
+	MissionControl         types.Bool   `tfsdk:"mission_control"`
+	MobileMe               types.Bool   `tfsdk:"mobile_me"`
+	Mouse                  types.Bool   `tfsdk:"mouse"`
+	Network                types.Bool   `tfsdk:"network"`
+	Notifications          types.Bool   `tfsdk:"notifications"`
+	ParentalControls       types.Bool   `tfsdk:"parental_controls"`
+	PreferenceBehavior     types.String `tfsdk:"preference_behavior"`
+	PrintAndScan           types.Bool   `tfsdk:"print_and_scan"`
+	Profiles               types.Bool   `tfsdk:"profiles"`
+	SecurityAndPrivacy     types.Bool   `tfsdk:"security_and_privacy"`
+	Sharing                types.Bool   `tfsdk:"sharing"`
+	SoftwareUpdate         types.Bool   `tfsdk:"software_update"`
+	Sound                  types.Bool   `tfsdk:"sound"`
+	Spotlight              types.Bool   `tfsdk:"spotlight"`
+	StartupDisk            types.Bool   `tfsdk:"startup_disk"`
+	TimeMachine            types.Bool   `tfsdk:"time_machine"`
+	Trackpad               types.Bool   `tfsdk:"trackpad"`
+	UsersAndGroups         types.Bool   `tfsdk:"users_and_groups"`
+	Xsan                   types.Bool   `tfsdk:"xsan"`
+	ICloud                 types.Bool   `tfsdk:"icloud"`
+}
+
+type RestrictionsSharingModel struct {
+	AddtoAperture                          types.Bool `tfsdk:"add_to_aperture"`
+	AddtoReadingList                       types.Bool `tfsdk:"add_to_reading_list"`
+	AddtoiPhoto                            types.Bool `tfsdk:"add_to_iphoto"`
+	AirDrop                                types.Bool `tfsdk:"air_drop"`
+	AutomaticallyEnableNewSharingServices  types.Bool `tfsdk:"automatically_enable_new_sharing_services"`
+	Facebook                               types.Bool `tfsdk:"facebook"`
+	Mail                                   types.Bool `tfsdk:"mail"`
+	Messages                               types.Bool `tfsdk:"messages"`
+	RestrictWhichSharingServicesAreEnabled types.Bool `tfsdk:"restrict_which_sharing_services_are_enabled"`
+	SinaWeibo                              types.Bool `tfsdk:"sina_weibo"`
+	Twitter                                types.Bool `tfsdk:"twitter"`
+	VideoServices                          types.Bool `tfsdk:"video_services"`
+}
+
+type RestrictionsWidgetsModel struct {
+	AllowOnlyConfiguredWidgets types.Bool `tfsdk:"allow_only_configured_widgets"`
+	AllowedWidgets             types.List `tfsdk:"allowed_widgets"`
+}

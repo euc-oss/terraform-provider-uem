@@ -1,0 +1,197 @@
+# Terraform Provider testing workflow
+name: Tests
+
+on:
+  pull_request:
+    paths-ignore:
+      - 'README.md'
+      - 'docs/**'
+      - '**.md'
+  push:
+    branches:
+      - main
+      - develop
+    paths-ignore:
+      - 'README.md'
+      - 'docs/**'
+      - '**.md'
+  schedule:
+    # Run tests weekly on Monday at 9 AM UTC
+    - cron: '0 9 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  # Ensure project builds before running testing matrix
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: actions/setup-go@44694675825211faa026b3c33043df3e48a5fa00 # v6.0.0
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+      - name: Configure Git for private modules
+        run: git config --global url."https://${{ secrets.GO_MODULES_TOKEN }}@github.com/".insteadOf "https://github.com/"
+      - run: go mod download
+      - run: go build -v .
+      - name: Run linters
+        uses: golangci/golangci-lint-action@0a35821d5c230e903fcfe077583637dea1b27b47 # v9.0.0
+        with:
+          version: latest
+
+  generate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: actions/setup-go@44694675825211faa026b3c33043df3e48a5fa00 # v6.0.0
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+      - name: Configure Git for private modules
+        run: git config --global url."https://${{ secrets.GO_MODULES_TOKEN }}@github.com/".insteadOf "https://github.com/"
+      # We need the latest version of Terraform for our documentation generation to use
+      - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
+        with:
+          terraform_wrapper: false
+      - run: make generate
+      - name: git diff
+        run: |
+          git diff --compact-summary --exit-code || \
+            (echo; echo "Unexpected difference in directories after code generation. Run 'make generate' command and commit."; exit 1)
+
+  # Run unit tests
+  unit-test:
+    name: Unit Tests
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      - name: Configure Git for private modules
+        run: git config --global url."https://${{ secrets.GO_MODULES_TOKEN }}@github.com/".insteadOf "https://github.com/"
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Run unit tests
+        run: go test -v -cover -race ./internal/provider/
+
+      - name: Generate coverage report
+        run: |
+          go test -coverprofile=coverage.out ./internal/provider/
+          go tool cover -html=coverage.out -o coverage.html
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage.html
+
+  # Run acceptance tests in a matrix with Terraform CLI versions
+  acceptance-test:
+    name: Acceptance Tests (Terraform ${{ matrix.terraform }})
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        terraform:
+          - '1.0.*'
+          - '1.1.*'
+          - '1.2.*'
+          - '1.3.*'
+          - '1.4.*'
+          - '1.5.*'
+          - '1.6.*'
+          - '1.7.*'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      - name: Configure Git for private modules
+        run: git config --global url."https://${{ secrets.GO_MODULES_TOKEN }}@github.com/".insteadOf "https://github.com/"
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ matrix.terraform }}
+          terraform_wrapper: false
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Run acceptance tests
+        env:
+          TF_ACC: "1"
+        run: go test -v -cover ./internal/provider/
+        timeout-minutes: 15
+        continue-on-error: true
+
+  # Test examples
+  example-test:
+    name: Example Tests
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      - name: Configure Git for private modules
+        run: git config --global url."https://${{ secrets.GO_MODULES_TOKEN }}@github.com/".insteadOf "https://github.com/"
+
+      - name: Build and install provider locally
+        run: make install
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Terraform fmt check
+        run: terraform fmt -check -recursive examples/
+
+      - name: Terraform init (basic-create)
+        run: |
+          cd examples/resources/uem_profile/basic-create
+          terraform init
+
+      - name: Terraform validate (basic-create)
+        run: |
+          cd examples/resources/uem_profile/basic-create
+          terraform validate
+
+      - name: Terraform init (import-existing)
+        run: |
+          cd examples/resources/uem_profile/import-existing
+          terraform init
+
+      - name: Terraform validate (import-existing)
+        run: |
+          cd examples/resources/uem_profile/import-existing
+          terraform validate
