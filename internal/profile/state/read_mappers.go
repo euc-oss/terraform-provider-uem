@@ -62,24 +62,30 @@ func readGeneralV2IntoState(data *ProfileResourceModel, g *sdk.GeneralPayloadV2E
 	if g.ManagedLocationGroupID != nil {
 		data.OrgGroupID = types.StringValue(strconv.Itoa(*g.ManagedLocationGroupID))
 	}
-	// Map assigned/excluded smart groups from API to state
-	data.AssignedSmartGroups = nil
+	// Map assigned/excluded smart groups from API to state, preserving the
+	// distinction between "unset" (nil) and "explicitly empty" ([]) so the
+	// result stays consistent with what was planned/configured.
 	if len(g.AssignedSmartGroups) > 0 {
-		data.AssignedSmartGroups = make([]types.String, 0, len(g.AssignedSmartGroups))
+		newList := make([]types.String, 0, len(g.AssignedSmartGroups))
 		for _, sg := range g.AssignedSmartGroups {
 			if sg.SmartGroupID != nil {
-				data.AssignedSmartGroups = append(data.AssignedSmartGroups, types.StringValue(strconv.Itoa(*sg.SmartGroupID)))
+				newList = append(newList, types.StringValue(strconv.Itoa(*sg.SmartGroupID)))
 			}
 		}
+		data.AssignedSmartGroups = newList
+	} else if data.AssignedSmartGroups != nil {
+		data.AssignedSmartGroups = []types.String{}
 	}
-	data.ExcludedSmartGroups = nil
 	if len(g.ExcludedSmartGroups) > 0 {
-		data.ExcludedSmartGroups = make([]types.String, 0, len(g.ExcludedSmartGroups))
+		newList := make([]types.String, 0, len(g.ExcludedSmartGroups))
 		for _, sg := range g.ExcludedSmartGroups {
 			if sg.SmartGroupID != nil {
-				data.ExcludedSmartGroups = append(data.ExcludedSmartGroups, types.StringValue(strconv.Itoa(*sg.SmartGroupID)))
+				newList = append(newList, types.StringValue(strconv.Itoa(*sg.SmartGroupID)))
 			}
 		}
+		data.ExcludedSmartGroups = newList
+	} else if data.ExcludedSmartGroups != nil {
+		data.ExcludedSmartGroups = []types.String{}
 	}
 }
 
