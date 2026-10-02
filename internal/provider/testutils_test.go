@@ -41,13 +41,14 @@ func stringVal(s string) tftypes.Value {
 
 func allNullProviderConfig() map[string]tftypes.Value {
 	return map[string]tftypes.Value{
-		"instance_url":     nullString(),
-		"tenant_code":      nullString(),
-		"auth_method":      nullString(),
-		"username":         nullString(),
-		"password":         nullString(),
-		"client_id":        nullString(),
-		"client_secret":    nullString(),
-		"oauth2_token_url": nullString(),
+		"instance_url":            nullString(),
+		"tenant_code":             nullString(),
+		"auth_method":             nullString(),
+		"username":                nullString(),
+		"password":                nullString(),
+		"client_id":               nullString(),
+		"client_secret":           nullString(),
+		"oauth2_token_url":        nullString(),
+		"app_binary_storage_path": nullString(),
 	}
 }

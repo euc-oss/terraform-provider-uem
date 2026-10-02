@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	sdk "github.com/euc-oss/terraform-sdk-uem"
+	sdk "github.com/euc-oss/terraform-sdk-uem/v26"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 
 	"github.com/euc-oss/terraform-provider-uem/internal/application/assignment/models"
@@ -83,7 +83,7 @@ func TestAppAssignmentRuleToAPI_MapsCoreFields(t *testing.T) {
 	}
 
 	got := api.Assignments[0]
-	if got.Priority == nil || *got.Priority != 7 {
+	if got.Priority != 7 {
 		t.Fatalf("unexpected priority: %#v", got.Priority)
 	}
 	if got.Distribution.Name != "Prod Rollout" {

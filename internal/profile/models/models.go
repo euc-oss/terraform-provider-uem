@@ -1,6 +1,9 @@
 package models
 
-import "github.com/hashicorp/terraform-plugin-framework/types"
+import (
+	"github.com/hashicorp/terraform-plugin-framework/attr"
+	"github.com/hashicorp/terraform-plugin-framework/types"
+)
 
 type ProfileResourceModel struct {
 	ID                  types.String              `tfsdk:"id"`
@@ -19,6 +22,14 @@ type ProfileResourceModel struct {
 	DiskEncryption      *DiskEncryptionModel      `tfsdk:"disk_encryption"`
 	Gatekeeper          *GatekeeperModel          `tfsdk:"gatekeeper"`
 	Restrictions        *RestrictionsModel        `tfsdk:"restrictions"`
+	SystemExtensions    *SystemExtensionsModel    `tfsdk:"system_extensions"`
+	PrivacyPreferences  []PrivacyPreferenceModel  `tfsdk:"privacy_preferences"`
+	ScepList            []ScepItemModel           `tfsdk:"scep_list"`
+	WebClipsList        []WebClipItemModel        `tfsdk:"web_clips_list"`
+	VpnList             []VPNItemModel            `tfsdk:"vpn_list"`
+	EasMicrosoftOutlook *EasMicrosoftOutlookModel `tfsdk:"eas_microsoft_outlook"`
+	KernelExtension     *KernelExtensionModel     `tfsdk:"kernel_extension"`
+	CustomAttributes    []CustomAttributeModel    `tfsdk:"custom_attributes"`
 	UUID                types.String              `tfsdk:"uuid"`
 	ProfileContext      types.String              `tfsdk:"profile_context"`
 	AssignedSmartGroups []types.String            `tfsdk:"assigned_smart_groups"`
@@ -95,7 +106,25 @@ type PasscodeModel struct {
 type DiskEncryptionModel struct {
 	AirWatch  *DiskEncryptionAirWatchModel  `tfsdk:"airwatch"`
 	FileVault *DiskEncryptionFileVaultModel `tfsdk:"filevault2"`
-	MCX       *DiskEncryptionMCXModel       `tfsdk:"mcx"`
+	// MCX is a types.Object, not a *DiskEncryptionMCXModel pointer (B42
+	// follow-up): the framework marks a fresh Optional+Computed
+	// SingleNestedAttribute unknown on create when configuration omits it,
+	// and a raw Go pointer struct field cannot decode an unknown value ("cannot
+	// handle unknown values"). types.Object holds null/unknown/known directly,
+	// so decoding req.Plan.Get into this field never panics regardless of
+	// which of the three states the plan carries. See
+	// DiskEncryptionMCXAttrTypes for the attribute types used to construct and
+	// decode this value, matching the "mcx" schema in resource.go.
+	MCX types.Object `tfsdk:"mcx"`
+}
+
+// DiskEncryptionMCXAttrTypes is disk_encryption.mcx's attribute types,
+// matching the SingleNestedAttribute schema in resource.go. Used wherever a
+// DiskEncryptionModel.MCX types.Object value needs to be constructed
+// (types.ObjectValueMust/types.ObjectNull) — the read mapper building state
+// from UEM's response, and tests.
+var DiskEncryptionMCXAttrTypes = map[string]attr.Type{
+	"destroy_fv_key_on_standby": types.BoolType,
 }
 
 type DiskEncryptionAirWatchModel struct {
@@ -130,10 +159,6 @@ type DiskEncryptionFileVaultModel struct {
 	Username                       types.String `tfsdk:"username"`
 	PromptToEnableFileVaultAt      types.Int64  `tfsdk:"prompt_to_enable_filevault_at"`
 	NumberOfTimesUserCanBypass     types.Int64  `tfsdk:"number_of_times_user_can_bypass"`
-}
-
-type DiskEncryptionMCXModel struct {
-	DestroyFVKeyOnStandby types.Bool `tfsdk:"destroy_fv_key_on_standby"`
 }
 
 // GatekeeperModel maps to MacOsGatekeeperPayloadV2Entity, surfaced in the UEM
@@ -335,7 +360,230 @@ type RestrictionsSharingModel struct {
 	VideoServices                          types.Bool `tfsdk:"video_services"`
 }
 
+// SystemExtensionsModel maps to MacOsSystemExtensionsPayloadV2Model
+// (macOS System Extensions, distinct from the older/legacy KernelExtension
+// payload, which stays unmodeled). AllowUserOverrides is a single toggle;
+// the two lists are independent allow-list collections — one scoped by
+// team identifier + extension TYPE, one scoped by a specific bundle+team
+// identifier pair.
+type SystemExtensionsModel struct {
+	AllowUserOverrides          types.Bool                        `tfsdk:"allow_user_overrides"`
+	AllowedSystemExtensionTypes []AllowedSystemExtensionTypeModel `tfsdk:"allowed_system_extension_types"`
+	AllowedSystemExtensions     []AllowedSystemExtensionModel     `tfsdk:"allowed_system_extensions"`
+}
+
+// AllowedSystemExtensionTypeModel maps to
+// MacOsAllowedSystemExtensionTypesV2Model: which system-extension TYPES
+// (driver, endpoint security, network) a given team identifier is allowed
+// to install, without naming a specific extension.
+type AllowedSystemExtensionTypeModel struct {
+	TeamIdentifier                     types.String `tfsdk:"team_identifier"`
+	AllowDriverExtensionType           types.Bool   `tfsdk:"allow_driver_extension_type"`
+	AllowEndpointSecurityExtensionType types.Bool   `tfsdk:"allow_endpoint_security_extension_type"`
+	AllowNetworkExtensionType          types.Bool   `tfsdk:"allow_network_extension_type"`
+}
+
+// AllowedSystemExtensionModel maps to MacOsAllowedSystemExtensionV2Model: a
+// specific system extension (by bundle identifier and/or team identifier)
+// that is always approved. Both fields are Optional on the SDK side with
+// ambiguous doc coverage of whether at least one is required — see the
+// design doc's SDK-gap note; no cross-field validator until live-confirmed.
+type AllowedSystemExtensionModel struct {
+	BundleIdentifier types.String `tfsdk:"bundle_identifier"`
+	TeamIdentifier   types.String `tfsdk:"team_identifier"`
+}
+
+// PrivacyPreferenceModel maps to one entry of
+// MacOsPrivacyPreferencesPayloadV2Model.Identities
+// (MacOsPrivacyPreferencesV2Model): a single PPPC (Privacy Preferences
+// Policy Control) rule scoped to one target binary (identified by
+// identifier/identifier_type), granting or denying access to a fixed set of
+// privacy-sensitive resources plus an optional list of Apple Events it may
+// send to other processes.
+type PrivacyPreferenceModel struct {
+	Identifier                   types.String      `tfsdk:"identifier"`
+	IdentifierType               types.String      `tfsdk:"identifier_type"`
+	CodeRequirement              types.String      `tfsdk:"code_requirement"`
+	Comment                      types.String      `tfsdk:"comment"`
+	AppleEventsList              []AppleEventModel `tfsdk:"apple_events_list"`
+	StaticCode                   types.Bool        `tfsdk:"static_code"`
+	Accessibility                types.String      `tfsdk:"accessibility"`
+	AddressBook                  types.String      `tfsdk:"address_book"`
+	Calendar                     types.String      `tfsdk:"calendar"`
+	Camera                       types.String      `tfsdk:"camera"`
+	FileProviderPresence         types.String      `tfsdk:"file_provider_presence"`
+	ListenEvent                  types.String      `tfsdk:"listen_event"`
+	MediaLibrary                 types.String      `tfsdk:"media_library"`
+	Microphone                   types.String      `tfsdk:"microphone"`
+	Photos                       types.String      `tfsdk:"photos"`
+	PostEvent                    types.String      `tfsdk:"post_event"`
+	Reminders                    types.String      `tfsdk:"reminders"`
+	ScreenCapture                types.String      `tfsdk:"screen_capture"`
+	SpeechRecognition            types.String      `tfsdk:"speech_recognition"`
+	SystemPolicyAllFiles         types.String      `tfsdk:"system_policy_all_files"`
+	SystemPolicyDesktopFolder    types.String      `tfsdk:"system_policy_desktop_folder"`
+	SystemPolicyDocumentsFolder  types.String      `tfsdk:"system_policy_documents_folder"`
+	SystemPolicyDownloadsFolder  types.String      `tfsdk:"system_policy_downloads_folder"`
+	SystemPolicyNetworkVolumes   types.String      `tfsdk:"system_policy_network_volumes"`
+	SystemPolicyRemovableVolumes types.String      `tfsdk:"system_policy_removable_volumes"`
+	SystemPolicySysAdminFiles    types.String      `tfsdk:"system_policy_sys_admin_files"`
+}
+
+// AppleEventModel maps to AppleEventV2: one entry in a PrivacyPreferenceModel's
+// apple_events_list, naming a specific receiver process and whether this
+// identity is allowed to send it Apple Events.
+type AppleEventModel struct {
+	CodeRequirement types.String `tfsdk:"code_requirement"`
+	Identifier      types.String `tfsdk:"identifier"`
+	IdentifierType  types.String `tfsdk:"identifier_type"`
+	Permission      types.String `tfsdk:"permission"`
+}
+
 type RestrictionsWidgetsModel struct {
 	AllowOnlyConfiguredWidgets types.Bool `tfsdk:"allow_only_configured_widgets"`
 	AllowedWidgets             types.List `tfsdk:"allowed_widgets"`
+}
+
+// ScepItemModel maps to AppleOsXScepPayloadEntityV2 (terraform-sdk-uem
+// internal/mdm/v2/models.go:4238), one macOS SCEP payload. Every field is
+// sent by the SDK create/update body and read back, so each is
+// Optional+Computed pass-through: no validator or default has a UEM source.
+type ScepItemModel struct {
+	Name                    types.String                 `tfsdk:"name"`
+	CredentialSource        types.String                 `tfsdk:"credential_source"`
+	CertificateAuthorityID  types.Int64                  `tfsdk:"certificate_authority_id"`
+	CertificateTemplateID   types.Int64                  `tfsdk:"certificate_template_id"`
+	AllowExportFromKeyChain types.Bool                   `tfsdk:"allow_export_from_key_chain"`
+	IdentityPreference      *ScepIdentityPreferenceModel `tfsdk:"identity_preference"`
+}
+
+// ScepIdentityPreferenceModel maps to MacOsScepIdentityPreferencePayloadV2Model
+// (models.go:5717).
+type ScepIdentityPreferenceModel struct {
+	Names types.List `tfsdk:"names"`
+}
+
+// WebClipItemModel maps to MacOsWebClipsPayloadV2Entity (terraform-sdk-uem
+// internal/mdm/v2/models.go:5822), one macOS Web Clip. All four fields are
+// sent by the SDK create/update body and read back as-is. Icon is the id of
+// an image already uploaded to UEM; this provider doesn't upload it.
+type WebClipItemModel struct {
+	Label            types.String `tfsdk:"label"`
+	URL              types.String `tfsdk:"url"`
+	ShowInAppCatalog types.Bool   `tfsdk:"show_in_app_catalog"`
+	Icon             types.Int64  `tfsdk:"icon"`
+}
+
+// Generated from the SDK structs (F13): every field is sent by the SDK
+// create/update body and read back; the secrets are write-only (UEM returns
+// them masked as *****).
+// VPNProxyNone is the wire value UEM uses for "no proxy" on a macOS VPN
+// payload's Proxy (C# HTTPProxyType). UEM requires Proxy on every create and
+// update, for every ConnectionType: [NotNullValidation(ErrorMessage = "VPN.Proxy
+// cannot be null")] at AirWatch.ServiceModel/Profiles/V2/Resources/AppleOsX/
+// AppleOsXVpnPayloadEntity.cs:466-473, rejecting null, "" and whitespace
+// (Framework/Source/AirWatchCore/Validation/NotNullValidationAttribute.cs:43-50).
+// But a GET omits Proxy when it is unset (ProfileServiceV2Helper.cs:2091-2095
+// skips empty settings; JsonNetFormatter uses NullValueHandling.Ignore), which
+// is the normal case for console-created AirwatchTunnel profiles. "None" is
+// the picklist value for no proxy (setting 3192, line 1098 of
+// deviceProfile.DevicePlatformSettingOption.seed.sql) and the platform default. Same in 26.2 and
+// 26.4 (canonical report 2026-09-26, macOS VPN proxy).
+const VPNProxyNone = "None"
+
+// VPNItemModel maps to AppleOsXVpnPayloadEntityV2 (terraform-sdk-uem internal/mdm/v2/models.go:4264).
+type VPNItemModel struct {
+	Account                       types.String              `tfsdk:"account"`
+	AppMapping                    types.Bool                `tfsdk:"app_mapping"`
+	ApplicationBundleID           types.List                `tfsdk:"application_bundle_id"`
+	AssociatedDomains             types.List                `tfsdk:"associated_domains"`
+	CalendarDomains               types.List                `tfsdk:"calendar_domains"`
+	ConnectAutomatically          types.Bool                `tfsdk:"connect_automatically"`
+	ConnectionName                types.String              `tfsdk:"connection_name"`
+	ConnectionType                types.String              `tfsdk:"connection_type"`
+	ContactsDomains               types.List                `tfsdk:"contacts_domains"`
+	CustomDatas                   []VPNItemCustomDatasModel `tfsdk:"custom_datas"`
+	EnableSafariDomains           types.Bool                `tfsdk:"enable_safari_domains"`
+	EnableVPNOnDemand             types.Bool                `tfsdk:"enable_vpn_on_demand"`
+	EncryptionLevel               types.Int64               `tfsdk:"encryption_level"`
+	ExcludeLocalNetworks          types.Bool                `tfsdk:"exclude_local_networks"`
+	ExcludedDomains               types.List                `tfsdk:"excluded_domains"`
+	GroupName                     types.String              `tfsdk:"group_name"`
+	IdentityCertificate           types.String              `tfsdk:"identity_certificate"`
+	IncludeAllNetworks            types.Bool                `tfsdk:"include_all_networks"`
+	IncludeUserPIN                types.Bool                `tfsdk:"include_user_pin"`
+	MachineAuthentication         types.Int64               `tfsdk:"machine_authentication"`
+	MailDomains                   types.List                `tfsdk:"mail_domains"`
+	MdmAssignedID                 types.String              `tfsdk:"mdm_assigned_id"`
+	MdmDeviceSerialNumber         types.String              `tfsdk:"mdm_device_serial_number"`
+	MdmDeviceUniqueID             types.String              `tfsdk:"mdm_device_unique_id"`
+	MdmDeviceWifiMACAddress       types.String              `tfsdk:"mdm_device_wifi_mac_address"`
+	Password                      types.String              `tfsdk:"password"`
+	PerAppVPN                     types.Bool                `tfsdk:"per_app_vpn"`
+	Port                          types.Int64               `tfsdk:"port"`
+	PromptForPassword             types.Bool                `tfsdk:"prompt_for_password"`
+	ProviderDesignatedRequirement types.String              `tfsdk:"provider_designated_requirement"`
+	ProviderType                  types.String              `tfsdk:"provider_type"`
+	Proxy                         types.String              `tfsdk:"proxy"`
+	ProxyServer                   types.String              `tfsdk:"proxy_server"`
+	ProxyServerAutoConfigURL      types.String              `tfsdk:"proxy_server_auto_config_url"`
+	SafariDomains                 types.List                `tfsdk:"safari_domains"`
+	SendAllTraffic                types.Bool                `tfsdk:"send_all_traffic"`
+	Server                        types.String              `tfsdk:"server"`
+	SharedSecret                  types.String              `tfsdk:"shared_secret"`
+	UseHybridAuthentication       types.Bool                `tfsdk:"use_hybrid_authentication"`
+	UserAuthentication            types.String              `tfsdk:"user_authentication"`
+	UserName                      types.String              `tfsdk:"user_name"`
+	VPNOnDemand                   []VPNItemVPNOnDemandModel `tfsdk:"vpn_on_demand"`
+	VPNPassword                   types.String              `tfsdk:"vpn_password"`
+	WebLogon                      types.Bool                `tfsdk:"web_logon"`
+}
+
+// VPNItemCustomDatasModel maps to CustomDataV2 (terraform-sdk-uem internal/mdm/v2/models.go:5120).
+type VPNItemCustomDatasModel struct {
+	Key   types.String `tfsdk:"key"`
+	Value types.String `tfsdk:"value"`
+}
+
+// VPNItemVPNOnDemandModel maps to AppleOsXVpnOnDemandEntityV2 (terraform-sdk-uem internal/mdm/v2/models.go:4255).
+type VPNItemVPNOnDemandModel struct {
+	Domain         types.String `tfsdk:"domain"`
+	OnDemandAction types.String `tfsdk:"on_demand_action"`
+}
+
+// EasMicrosoftOutlookModel maps to AppleOsXEasMicrosoftOutlookPayloadEntityV2 (terraform-sdk-uem internal/mdm/v2/models.go:3676).
+type EasMicrosoftOutlookModel struct {
+	AccountName                types.String `tfsdk:"account_name"`
+	DirectoryServer            types.String `tfsdk:"directory_server"`
+	DirectoryServerPort        types.String `tfsdk:"directory_server_port"`
+	DirectoryServerRequiresSSL types.Bool   `tfsdk:"directory_server_requires_ssl"`
+	Domain                     types.String `tfsdk:"domain"`
+	EmailAddress               types.String `tfsdk:"email_address"`
+	ExchangeHost               types.String `tfsdk:"exchange_host"`
+	ExchangePort               types.String `tfsdk:"exchange_port"`
+	Password                   types.String `tfsdk:"password"`
+	SearchBase                 types.String `tfsdk:"search_base"`
+	UseSSL                     types.Bool   `tfsdk:"use_ssl"`
+	UserName                   types.String `tfsdk:"user_name"`
+}
+
+// KernelExtensionModel maps to MacOsKernelExtensionPayloadV2Entity (terraform-sdk-uem internal/mdm/v2/models.go:5634).
+type KernelExtensionModel struct {
+	AllowUserOverrides      types.Bool                                    `tfsdk:"allow_user_overrides"`
+	AllowedKernelExtensions []KernelExtensionAllowedKernelExtensionsModel `tfsdk:"allowed_kernel_extensions"`
+	AllowedTeamIdentifiers  types.List                                    `tfsdk:"allowed_team_identifiers"`
+}
+
+// KernelExtensionAllowedKernelExtensionsModel maps to MacOsAllowedKernelExtensionsEntityV2 (terraform-sdk-uem internal/mdm/v2/models.go:5548).
+type KernelExtensionAllowedKernelExtensionsModel struct {
+	BundleIdentifier types.String `tfsdk:"bundle_identifier"`
+	TeamIdentifier   types.String `tfsdk:"team_identifier"`
+}
+
+// CustomAttributeModel maps to MacOsCustomAttributePayloadV2Model (terraform-sdk-uem internal/mdm/v2/models.go:5602).
+type CustomAttributeModel struct {
+	AttributeName   types.String `tfsdk:"attribute_name"`
+	AttributeScript types.String `tfsdk:"attribute_script"`
+	Events          types.List   `tfsdk:"events"`
+	Schedule        types.Int64  `tfsdk:"schedule"`
 }

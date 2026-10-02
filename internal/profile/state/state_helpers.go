@@ -7,7 +7,7 @@ import (
 
 	commonerrors "github.com/euc-oss/terraform-provider-uem/internal/common/errors"
 	profilemodels "github.com/euc-oss/terraform-provider-uem/internal/profile/models"
-	sdk "github.com/euc-oss/terraform-sdk-uem"
+	sdk "github.com/euc-oss/terraform-sdk-uem/v26"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 )
 
@@ -207,23 +207,11 @@ func IsValidProfileContext(v string) bool {
 	return v == "User" || v == "Device"
 }
 
-func EnsureComputedDefaults(data *profilemodels.ProfileResourceModel) {
-	if data.ProfileScope.IsNull() || data.ProfileScope.IsUnknown() {
-		data.ProfileScope = types.StringValue("Production")
-	}
-	if data.AssignmentType.IsNull() || data.AssignmentType.IsUnknown() {
-		data.AssignmentType = types.StringValue("Auto")
-	}
-	if data.IsActive.IsNull() || data.IsActive.IsUnknown() {
-		data.IsActive = types.BoolValue(true)
-	}
-	if data.UUID.IsNull() || data.UUID.IsUnknown() {
-		data.UUID = types.StringValue("")
-	}
-	if data.Description.IsNull() || data.Description.IsUnknown() {
-		data.Description = types.StringValue("")
-	}
-}
+// internal-ticket removed EnsureComputedDefaults, which used to force a null
+// ProfileScope/AssignmentType/IsActive/UUID to "Production"/"Auto"/true/""
+// after every Read (row #96 of the B16 audit: never observed live, no
+// source). Read now stores exactly what UEM returned for those fields, with
+// no post-hoc defaulting.
 
 func UploadCertificatesTyped(ctx context.Context, client *sdk.Client, items, priorCreds []profilemodels.CredentialItemModel) ([]profilemodels.CredentialItemModel, error) {
 	priorByName := make(map[string]profilemodels.CredentialItemModel, len(priorCreds))
@@ -285,12 +273,13 @@ func UploadCertificatesTyped(ctx context.Context, client *sdk.Client, items, pri
 	return out, nil
 }
 
+// internal-ticket: no longer drops the whole credentials_list when no
+// network_list entry references it (row #97 of the B16 audit: never
+// observed live, no source -- this silently sent an empty list to UEM even
+// though the user configured credentials). Every configured credential is
+// now sent, referenced or not.
 func PrepareCredentialsForPayload(ctx context.Context, client *sdk.Client, data *profilemodels.ProfileResourceModel, priorCreds []profilemodels.CredentialItemModel) error {
 	if len(data.CredentialsList) == 0 {
-		return nil
-	}
-	if !AnyNetworkReferencesCredential(data.NetworkList, data.CredentialsList) {
-		data.CredentialsList = nil
 		return nil
 	}
 	updated, err := UploadCertificatesTyped(ctx, client, data.CredentialsList, priorCreds)
@@ -299,23 +288,6 @@ func PrepareCredentialsForPayload(ctx context.Context, client *sdk.Client, data 
 	}
 	data.CredentialsList = updated
 	return nil
-}
-
-func AnyNetworkReferencesCredential(networks []profilemodels.NetworkItemModel, creds []profilemodels.CredentialItemModel) bool {
-	credNames := make(map[string]struct{}, len(creds))
-	for _, c := range creds {
-		if !c.CredentialName.IsNull() && !c.CredentialName.IsUnknown() {
-			credNames[c.CredentialName.ValueString()] = struct{}{}
-		}
-	}
-	for _, n := range networks {
-		if !n.IdentityCertificate.IsNull() && !n.IdentityCertificate.IsUnknown() {
-			if _, ok := credNames[n.IdentityCertificate.ValueString()]; ok {
-				return true
-			}
-		}
-	}
-	return false
 }
 
 func CredentialKey(item profilemodels.CredentialItemModel) (string, bool) {
@@ -329,272 +301,187 @@ func CredentialKey(item profilemodels.CredentialItemModel) (string, bool) {
 	return name, true
 }
 
-func MergeCredentialsListWithPriorState(apiList, stateList []profilemodels.CredentialItemModel) []profilemodels.CredentialItemModel {
+// internal-ticket removed MergeCredentialsListWithPriorState and
+// MergeNetworkListWithPriorState (rows #87/#88 of the B16 audit: never
+// observed live, no source). credentials_list and network_list are now
+// stored exactly as mapAppleOsXCredentialsList/mapAppleOsXNetworkList
+// returned them, with no name/index-keyed pinning of CredentialSource,
+// CredentialName, IdentityCertificate, or any other field back to the prior
+// state, and no KeepState/PreserveNull fallback for fields UEM's response
+// left null.
+//
+// EXPECTED DIFF RISK: if UEM rewrites CredentialName (e.g. "DefinedCA" ->
+// "DefinedCertificateAuthority", or an Upload credential's name to
+// "Certificate #N") or the network's IdentityCertificate join key, plans
+// will now show that rename as drift on every apply. This is real
+// server-side drift the removed code was masking, not a bug -- see the
+// CHANGELOG entry.
+
+// internal-ticket removed KeepStateString/KeepStateBool/KeepStateInt64 along
+// with their last callers (mergeNetworkItem, mergeAirWatch, mergeFileVault,
+// MergeGatekeeperWithPriorState's MCX field); nothing in this package falls
+// back to the prior state for a field UEM's response left null anymore.
+
+// internal-ticket removed MergeGatekeeperWithPriorState (row #74 of the B16
+// audit: never observed live, no source for masking fields the user left
+// null). mapAppleOsXGatekeeper's result is now stored directly, with no
+// merge against the prior state.
+
+// MergeSystemExtensionsWithPriorState reconciles UEM's response with the
+// user's prior config. The two nested lists get index/key-aligned reorder
+// treatment (see mergeAllowedSystemExtensionTypesWithPriorState /
+// mergeAllowedSystemExtensionsWithPriorState) confirmed live 2026-09-25;
+// internal-ticket removed this function's own PreserveNull on AllowUserOverrides
+// (row #78 of the B16 audit: never observed live, no source) -- that field
+// is now taken from the API response unmodified.
+func MergeSystemExtensionsWithPriorState(api, state *profilemodels.SystemExtensionsModel) *profilemodels.SystemExtensionsModel {
+	if api == nil {
+		return nil
+	}
+	if state == nil {
+		return api
+	}
+	api.AllowedSystemExtensionTypes = mergeAllowedSystemExtensionTypesWithPriorState(api.AllowedSystemExtensionTypes, state.AllowedSystemExtensionTypes)
+	api.AllowedSystemExtensions = mergeAllowedSystemExtensionsWithPriorState(api.AllowedSystemExtensions, state.AllowedSystemExtensions)
+	return api
+}
+
+// mergeAllowedSystemExtensionTypesWithPriorState is keyed by team_identifier
+// (the defining key of each entry -- see the design doc) rather than by
+// position. Confirmed live 2026-09-25 (as<internal-env>): UEM does not preserve
+// request order in its response (the "*" entry can come back first or last
+// independent of where it was sent), so a positional merge falsely reports
+// "changed" on every field of every reordered entry, tripping Terraform's
+// post-apply consistency check even though nothing actually changed. The
+// merged output is reordered to match stateList's own order (the user's
+// config on Create, or the previously-stable state on Update/Read), and any
+// api-only entry (no matching key in stateList -- e.g. a kept non-default
+// "*" default UEM injects with no prior config at all, see
+// isServerDefaultWildcardType) is appended, unmerged, in its original API
+// order. Duplicate keys on either side are paired deterministically by
+// arrival order (state's Nth occurrence of a key pairs with api's Nth
+// not-yet-consumed occurrence of that same key).
+//
+// internal-ticket removed the PreserveNull* calls this used to apply to each
+// matched item's fields (row #80 of the B16 audit: never confirmed live,
+// unlike the reorder itself). A matched item is now the API's value
+// unmodified; only its position in the result is reordered to match
+// stateList.
+func mergeAllowedSystemExtensionTypesWithPriorState(apiList, stateList []profilemodels.AllowedSystemExtensionTypeModel) []profilemodels.AllowedSystemExtensionTypeModel {
 	if apiList == nil {
 		return nil
 	}
-
-	stateByName := make(map[string]profilemodels.CredentialItemModel, len(stateList))
-	for _, s := range stateList {
-		if key, ok := CredentialKey(s); ok {
-			stateByName[key] = s
-		}
-	}
-
+	apiByKey := make(map[string][]int, len(apiList))
 	for i := range apiList {
-		var (
-			s       profilemodels.CredentialItemModel
-			matched bool
-		)
+		k := apiList[i].TeamIdentifier.ValueString()
+		apiByKey[k] = append(apiByKey[k], i)
+	}
+	consumed := make([]bool, len(apiList))
 
-		// Try name-keyed match first (stable across reorderings).
-		if key, ok := CredentialKey(apiList[i]); ok {
-			s, matched = stateByName[key]
-		}
-
-		// Fall back to index match. Required for Upload credentials whose
-		// CredentialName UEM auto-rewrites to "Certificate #N" — the live
-		// API name no longer matches the user-supplied prior-state name, so
-		// the keyed lookup misses. Position-by-index recovers them.
-		if !matched && i < len(stateList) {
-			s = stateList[i]
-			matched = true
-		}
-
-		if !matched {
+	result := make([]profilemodels.AllowedSystemExtensionTypeModel, 0, len(apiList))
+	for _, s := range stateList {
+		idx, ok := nextUnconsumed(apiByKey[s.TeamIdentifier.ValueString()], consumed)
+		if !ok {
 			continue
 		}
-
-		if apiList[i].CertificatePayload.IsNull() && !s.CertificatePayload.IsNull() {
-			apiList[i].CertificatePayload = s.CertificatePayload
-		}
-		if apiList[i].CertificatePassword.IsNull() && !s.CertificatePassword.IsNull() {
-			apiList[i].CertificatePassword = s.CertificatePassword
-		}
-		// CredentialSource and CredentialName are user-owned identifiers that
-		// UEM may normalize ("DefinedCA" → "DefinedCertificateAuthority") or
-		// auto-rename ("Certificate #N"). Pin to prior state when the user
-		// previously set them — same pattern as IdentityCertificate in the
-		// network merge — otherwise the post-apply consistency check fails
-		// with "inconsistent values for sensitive attribute" because
-		// credentials_list contains sensitive child fields.
-		if !s.CredentialSource.IsNull() {
-			apiList[i].CredentialSource = s.CredentialSource
-		} else {
-			apiList[i].CredentialSource = KeepStateString(apiList[i].CredentialSource, s.CredentialSource)
-		}
-		if !s.CredentialName.IsNull() {
-			apiList[i].CredentialName = s.CredentialName
-		} else {
-			apiList[i].CredentialName = KeepStateString(apiList[i].CredentialName, s.CredentialName)
-		}
-		// These are Optional (not Computed) on the schema, so when the user
-		// leaves them null the plan keeps them null. UEM returns concrete
-		// values for unset fields (false for the bools, 0 for the ints), and
-		// KeepStateBool/Int64 would let those win — flipping plan(null) →
-		// state(false/0) and tripping the post-apply consistency check
-		// ("inconsistent values for sensitive attribute" because the
-		// containing list has Sensitive children). PreserveNull* keeps the
-		// user-null semantics: state was null → final null; otherwise let
-		// the API value through.
-		apiList[i].AllowAccessToAllApplications = PreserveNullBool(apiList[i].AllowAccessToAllApplications, s.AllowAccessToAllApplications)
-		apiList[i].KeyIsExtractable = PreserveNullBool(apiList[i].KeyIsExtractable, s.KeyIsExtractable)
-		apiList[i].CertificateAuthority = PreserveNullInt64(apiList[i].CertificateAuthority, s.CertificateAuthority)
-		apiList[i].CertificateTemplate = PreserveNullInt64(apiList[i].CertificateTemplate, s.CertificateTemplate)
+		consumed[idx] = true
+		result = append(result, apiList[idx])
 	}
-	return apiList
+	for i := range apiList {
+		if !consumed[i] {
+			result = append(result, apiList[i])
+		}
+	}
+	return result
 }
 
-func MergeNetworkListWithPriorState(apiList, stateList []profilemodels.NetworkItemModel) []profilemodels.NetworkItemModel {
+// mergeAllowedSystemExtensionsWithPriorState is keyed by
+// bundle_identifier+team_identifier, same reordering shape as
+// mergeAllowedSystemExtensionTypesWithPriorState above and for the same
+// live-confirmed reason: UEM does not preserve request order.
+//
+// internal-ticket removed the second pass that used to match a prior entry
+// setting only one of bundle/team against an api entry sharing just that
+// one field, and the PreserveNull* calls applied to matched items (both row
+// #82 of the B16 audit: never confirmed live, unlike the exact-match reorder
+// itself). Only a prior entry that set BOTH fields is now reordered to match
+// stateList's position; every other api entry (including ones a
+// single-field prior entry would previously have claimed) is appended,
+// unmodified, in its original API order.
+func mergeAllowedSystemExtensionsWithPriorState(apiList, stateList []profilemodels.AllowedSystemExtensionModel) []profilemodels.AllowedSystemExtensionModel {
 	if apiList == nil {
 		return nil
 	}
+	byBoth := make(map[string][]int, len(apiList))
 	for i := range apiList {
-		if i >= len(stateList) {
-			break
+		b, t := apiList[i].BundleIdentifier.ValueString(), apiList[i].TeamIdentifier.ValueString()
+		byBoth[allowedSystemExtensionKey(b, t)] = append(byBoth[allowedSystemExtensionKey(b, t)], i)
+	}
+	consumed := make([]bool, len(apiList))
+
+	match := make([]int, len(stateList))
+	for i := range match {
+		match[i] = -1
+	}
+	for i, s := range stateList {
+		if s.BundleIdentifier.IsNull() || s.TeamIdentifier.IsNull() {
+			continue
 		}
-		mergeNetworkItem(&apiList[i], &stateList[i])
+		if idx, ok := nextUnconsumed(byBoth[allowedSystemExtensionKey(s.BundleIdentifier.ValueString(), s.TeamIdentifier.ValueString())], consumed); ok {
+			consumed[idx] = true
+			match[i] = idx
+		}
 	}
-	return apiList
+
+	result := make([]profilemodels.AllowedSystemExtensionModel, 0, len(apiList))
+	for _, idx := range match {
+		if idx < 0 {
+			continue
+		}
+		result = append(result, apiList[idx])
+	}
+	for i := range apiList {
+		if !consumed[i] {
+			result = append(result, apiList[i])
+		}
+	}
+	return result
 }
 
-func KeepStateString(apiVal, stateVal types.String) types.String {
-	if apiVal.IsNull() || apiVal.IsUnknown() {
-		return stateVal
-	}
-	return apiVal
+func allowedSystemExtensionKey(bundleIdentifier, teamIdentifier string) string {
+	return bundleIdentifier + "\x00" + teamIdentifier
 }
 
-func KeepStateBool(apiVal, stateVal types.Bool) types.Bool {
-	if apiVal.IsNull() || apiVal.IsUnknown() {
-		return stateVal
+// nextUnconsumed returns the first index in idxs not yet marked consumed,
+// which is how duplicate keys on both sides pair up deterministically: the
+// state list's Nth occurrence of a key always pairs with the api list's Nth
+// not-yet-consumed occurrence of that same key, in each side's own order.
+func nextUnconsumed(idxs []int, consumed []bool) (int, bool) {
+	for _, idx := range idxs {
+		if !consumed[idx] {
+			return idx, true
+		}
 	}
-	return apiVal
+	return 0, false
 }
 
-func KeepStateInt64(apiVal, stateVal types.Int64) types.Int64 {
-	if apiVal.IsNull() || apiVal.IsUnknown() {
-		return stateVal
-	}
-	return apiVal
-}
+// internal-ticket removed MergePrivacyPreferencesWithPriorState, identifierKey,
+// mergePrivacyPreferenceItem, and mergeAppleEventsListWithPriorState (row
+// #83 of the B16 audit). Unlike the system_extensions merges above, no
+// PPPC reorder was ever confirmed live -- the gate citation was conditional
+// ("if UEM reordered") and copied from the sysext contract -- so this was
+// removed in full rather than split: mapAppleOsXPrivacyPreferences's result
+// is now stored directly, with no keyed reorder and no PreserveNull against
+// the prior state.
 
-// MergeGatekeeperWithPriorState reconciles UEM's response with the user's prior
-// config. UEM always returns the GateKeeper block populated for macOS profiles
-// — even fields the caller didn't send come back with API defaults. On import
-// (state is nil) we surface every field so `terraform output | jq` reveals
-// the full live policy and the user can round-trip it into tfvars. On normal
-// reads (state non-nil) we suppress fields the user left null so each field
-// stays managed independently.
-func MergeGatekeeperWithPriorState(api, state *profilemodels.GatekeeperModel) *profilemodels.GatekeeperModel {
-	if api == nil {
-		return nil
-	}
-	if state == nil {
-		return api
-	}
-	if state.AllowAutoUnlock.IsNull() {
-		api.AllowAutoUnlock = types.BoolNull()
-	}
-	if state.AllowFingerprintForUnlock.IsNull() {
-		api.AllowFingerprintForUnlock = types.BoolNull()
-	}
-	if state.AllowHandoff.IsNull() {
-		api.AllowHandoff = types.BoolNull()
-	}
-	if state.AllowScreenCapture.IsNull() {
-		api.AllowScreenCapture = types.BoolNull()
-	}
-	if state.EnableAppSoftwareUpdateDelay.IsNull() {
-		api.EnableAppSoftwareUpdateDelay = types.BoolNull()
-	}
-	if state.EnableSoftwareUpdateDelay.IsNull() {
-		api.EnableSoftwareUpdateDelay = types.BoolNull()
-	}
-	if state.EnforcedSoftwareUpdateDelay.IsNull() {
-		api.EnforcedSoftwareUpdateDelay = types.Int64Null()
-	}
-	return api
-}
-
-func MergeDiskEncryptionWithPriorState(api, state *profilemodels.DiskEncryptionModel) *profilemodels.DiskEncryptionModel {
-	if api == nil {
-		return nil
-	}
-	if state == nil {
-		return api
-	}
-	// Drop API-only sub-blocks that the user did not configure. The WS1 API
-	// returns server-side defaults for some sub-blocks (e.g. DiskEncryptionMCX
-	// with DestroyFVKeyOnStandby=false) even when the caller did not include
-	// them in the request. Surfacing those defaults would conflict with a plan
-	// where the corresponding nested attribute is null.
-	if state.AirWatch == nil {
-		api.AirWatch = nil
-	}
-	if state.FileVault == nil {
-		api.FileVault = nil
-	}
-	if state.MCX == nil {
-		api.MCX = nil
-	}
-	if api.AirWatch != nil && state.AirWatch != nil {
-		mergeAirWatch(api.AirWatch, state.AirWatch)
-	}
-	if api.FileVault != nil && state.FileVault != nil {
-		mergeFileVault(api.FileVault, state.FileVault)
-	}
-	if api.MCX != nil && state.MCX != nil {
-		api.MCX.DestroyFVKeyOnStandby = KeepStateBool(api.MCX.DestroyFVKeyOnStandby, state.MCX.DestroyFVKeyOnStandby)
-	}
-	if api.AirWatch == nil && api.FileVault == nil && api.MCX == nil {
-		return nil
-	}
-	return api
-}
-
-func mergeNetworkItem(api, state *profilemodels.NetworkItemModel) {
-	api.NetworkInterface = KeepStateString(api.NetworkInterface, state.NetworkInterface)
-	api.ServiceSetIdentifier = KeepStateString(api.ServiceSetIdentifier, state.ServiceSetIdentifier)
-	api.HiddenNetwork = KeepStateBool(api.HiddenNetwork, state.HiddenNetwork)
-	api.AutoJoin = KeepStateBool(api.AutoJoin, state.AutoJoin)
-	api.SecurityType = KeepStateString(api.SecurityType, state.SecurityType)
-	api.Password = KeepStateString(api.Password, state.Password)
-	api.UseAsLoginWindowConfiguration = KeepStateBool(api.UseAsLoginWindowConfiguration, state.UseAsLoginWindowConfiguration)
-	api.UseDirectoryAuthentication = KeepStateBool(api.UseDirectoryAuthentication, state.UseDirectoryAuthentication)
-	api.TLS = KeepStateBool(api.TLS, state.TLS)
-	api.TTLS = KeepStateBool(api.TTLS, state.TTLS)
-	api.LEAP = KeepStateBool(api.LEAP, state.LEAP)
-	api.PEAP = KeepStateBool(api.PEAP, state.PEAP)
-	api.EAPFAST = KeepStateBool(api.EAPFAST, state.EAPFAST)
-	api.EAPSIM = KeepStateBool(api.EAPSIM, state.EAPSIM)
-	api.EAPAKA = KeepStateBool(api.EAPAKA, state.EAPAKA)
-	api.TLSMinimumVersion = KeepStateString(api.TLSMinimumVersion, state.TLSMinimumVersion)
-	api.TLSMaximumVersion = KeepStateString(api.TLSMaximumVersion, state.TLSMaximumVersion)
-	api.DisableAssociationMACRandomization = KeepStateBool(api.DisableAssociationMACRandomization, state.DisableAssociationMACRandomization)
-	api.UserName = KeepStateString(api.UserName, state.UserName)
-	api.UserPassword = KeepStateString(api.UserPassword, state.UserPassword)
-	// IdentityCertificate is the join key into credentials_list. UEM
-	// auto-rewrites the value to its server-side credential name (e.g.
-	// "Certificate #1") whenever the credential is reissued, even when the
-	// caller sent a stable user-chosen name. Pin to prior state when the
-	// user previously set one — otherwise the join breaks and Terraform
-	// shows a permanent in-place diff on every plan.
-	if !state.IdentityCertificate.IsNull() {
-		api.IdentityCertificate = state.IdentityCertificate
-	} else {
-		api.IdentityCertificate = KeepStateString(api.IdentityCertificate, state.IdentityCertificate)
-	}
-	api.InnerIdentity = KeepStateString(api.InnerIdentity, state.InnerIdentity)
-	api.OuterIdentity = KeepStateString(api.OuterIdentity, state.OuterIdentity)
-	api.UsePAC = KeepStateBool(api.UsePAC, state.UsePAC)
-	api.AllowTwoRANDs = KeepStateBool(api.AllowTwoRANDs, state.AllowTwoRANDs)
-	api.AllowTrustExceptions = KeepStateBool(api.AllowTrustExceptions, state.AllowTrustExceptions)
-	api.ProxyType = KeepStateString(api.ProxyType, state.ProxyType)
-	api.ProxyServer = KeepStateString(api.ProxyServer, state.ProxyServer)
-	api.ProxyServerPort = KeepStateInt64(api.ProxyServerPort, state.ProxyServerPort)
-	api.ProxyUsername = KeepStateString(api.ProxyUsername, state.ProxyUsername)
-	api.ProxyPassword = KeepStateString(api.ProxyPassword, state.ProxyPassword)
-	api.ProxyUrl = KeepStateString(api.ProxyUrl, state.ProxyUrl)
-	api.PacFallback = KeepStateBool(api.PacFallback, state.PacFallback)
-	if api.TrustedCertificates.IsNull() && !state.TrustedCertificates.IsNull() {
-		api.TrustedCertificates = state.TrustedCertificates
-	}
-}
-
-func mergeAirWatch(api, state *profilemodels.DiskEncryptionAirWatchModel) {
-	api.StoreKey = KeepStateBool(api.StoreKey, state.StoreKey)
-	api.RotateKeyAfter = KeepStateInt64(api.RotateKeyAfter, state.RotateKeyAfter)
-	api.UseIntelligentHub = KeepStateBool(api.UseIntelligentHub, state.UseIntelligentHub)
-	api.NotifyUserForEncryption = KeepStateBool(api.NotifyUserForEncryption, state.NotifyUserForEncryption)
-	api.EncryptionNotificationTitle = KeepStateString(api.EncryptionNotificationTitle, state.EncryptionNotificationTitle)
-	api.EncryptionNotificationMessage = KeepStateString(api.EncryptionNotificationMessage, state.EncryptionNotificationMessage)
-	api.EncryptionMaxNotifyAttempts = KeepStateInt64(api.EncryptionMaxNotifyAttempts, state.EncryptionMaxNotifyAttempts)
-	api.EncryptionNotificationRetryIntervalInHours = KeepStateInt64(api.EncryptionNotificationRetryIntervalInHours, state.EncryptionNotificationRetryIntervalInHours)
-	api.EncryptionActionAfterLastNotification = KeepStateInt64(api.EncryptionActionAfterLastNotification, state.EncryptionActionAfterLastNotification)
-	api.EnableRecoveryKey = KeepStateBool(api.EnableRecoveryKey, state.EnableRecoveryKey)
-	api.RecoveryKeyNotificationTitle = KeepStateString(api.RecoveryKeyNotificationTitle, state.RecoveryKeyNotificationTitle)
-	api.RecoveryKeyNotificationMessage = KeepStateString(api.RecoveryKeyNotificationMessage, state.RecoveryKeyNotificationMessage)
-	api.RecoveryKeyNotificationRetryIntervalInHours = KeepStateInt64(api.RecoveryKeyNotificationRetryIntervalInHours, state.RecoveryKeyNotificationRetryIntervalInHours)
-	api.RecoveryKeyPromptTitle = KeepStateString(api.RecoveryKeyPromptTitle, state.RecoveryKeyPromptTitle)
-	api.RecoveryKeyPromptMessage = KeepStateString(api.RecoveryKeyPromptMessage, state.RecoveryKeyPromptMessage)
-	api.RecoveryKeySuccessTitle = KeepStateString(api.RecoveryKeySuccessTitle, state.RecoveryKeySuccessTitle)
-	api.RecoveryKeySuccessMessage = KeepStateString(api.RecoveryKeySuccessMessage, state.RecoveryKeySuccessMessage)
-	api.RecoveryKeyErrorTitle = KeepStateString(api.RecoveryKeyErrorTitle, state.RecoveryKeyErrorTitle)
-	api.RecoveryKeyErrorMessage = KeepStateString(api.RecoveryKeyErrorMessage, state.RecoveryKeyErrorMessage)
-	api.RecoveryKeyMaxFailureCount = KeepStateInt64(api.RecoveryKeyMaxFailureCount, state.RecoveryKeyMaxFailureCount)
-}
-
-func mergeFileVault(api, state *profilemodels.DiskEncryptionFileVaultModel) {
-	api.Enable = KeepStateBool(api.Enable, state.Enable)
-	api.ShowRecoveryKey = KeepStateBool(api.ShowRecoveryKey, state.ShowRecoveryKey)
-	api.RecoveryType = KeepStateInt64(api.RecoveryType, state.RecoveryType)
-	api.FileVaultEnterpriseCertificate = KeepStateString(api.FileVaultEnterpriseCertificate, state.FileVaultEnterpriseCertificate)
-	api.FileVaultUser = KeepStateInt64(api.FileVaultUser, state.FileVaultUser)
-	api.Username = KeepStateString(api.Username, state.Username)
-	api.PromptToEnableFileVaultAt = KeepStateInt64(api.PromptToEnableFileVaultAt, state.PromptToEnableFileVaultAt)
-	api.NumberOfTimesUserCanBypass = KeepStateInt64(api.NumberOfTimesUserCanBypass, state.NumberOfTimesUserCanBypass)
-}
+// internal-ticket removed MergeDiskEncryptionWithPriorState, mergeAirWatch, and
+// mergeFileVault (rows #85/#86 of the B16 audit: never observed live, no
+// source), and mergeNetworkItem (row #88, alongside MergeNetworkListWithPriorState
+// above). disk_encryption and network_list sub-blocks are now stored exactly
+// as UEM returned them: no sub-block is dropped because the user left it
+// unconfigured, no field falls back to the prior state when the API sends
+// null, and IdentityCertificate is no longer pinned to the prior state (see
+// the EXPECTED DIFF RISK note above KeepStateString).
 
 func credentialDisplayName(item profilemodels.CredentialItemModel, idx int) string {
 	if key, ok := CredentialKey(item); ok {
@@ -613,56 +500,11 @@ func KeepStateList(apiVal, stateVal types.List) types.List {
 	return apiVal
 }
 
-// PreserveNullBool / PreserveNullString / PreserveNullInt64 / PreserveNullStringList
-// implement "user-didn't-configure-it" semantics for Optional (non-Computed)
-// nested attributes. If the prior state value was null the caller never
-// managed that field, so server-side defaults from the API must be discarded
-// (returning null), otherwise Terraform's post-apply consistency check fails
-// with "was null, but now cty.False" / etc. When the caller did set a value
-// in state, the API value wins so genuine drift is surfaced on Read.
-func PreserveNullBool(apiVal, stateVal types.Bool) types.Bool {
-	if stateVal.IsNull() {
-		return types.BoolNull()
-	}
-	if apiVal.IsNull() || apiVal.IsUnknown() {
-		return stateVal
-	}
-	return apiVal
-}
-
-func PreserveNullString(apiVal, stateVal types.String) types.String {
-	if stateVal.IsNull() {
-		return types.StringNull()
-	}
-	if apiVal.IsNull() || apiVal.IsUnknown() {
-		return stateVal
-	}
-	return apiVal
-}
-
-func PreserveNullInt64(apiVal, stateVal types.Int64) types.Int64 {
-	if stateVal.IsNull() {
-		return types.Int64Null()
-	}
-	if apiVal.IsNull() || apiVal.IsUnknown() {
-		return stateVal
-	}
-	return apiVal
-}
-
-// PreserveNullStringList is the string-list variant of the PreserveNull*
-// helpers. The element type is hardcoded to types.StringType; callers needing
-// other element types must derive the null value themselves rather than reuse
-// this helper.
-func PreserveNullStringList(apiVal, stateVal types.List) types.List {
-	if stateVal.IsNull() {
-		return types.ListNull(types.StringType)
-	}
-	if apiVal.IsNull() || apiVal.IsUnknown() {
-		return stateVal
-	}
-	return apiVal
-}
+// internal-ticket removed PreserveNullBool, PreserveNullString, PreserveNullInt64,
+// and PreserveNullStringList along with their last callers (the credentials,
+// system_extensions, PPPC, and restrictions merges above): nothing in this
+// package discards an API value because the prior state had that field
+// null anymore.
 
 // stringSliceToTFList converts a []string from the SDK into a Terraform
 // types.List. Returns ListNull when the slice is empty so no spurious diff
@@ -678,10 +520,20 @@ func stringSliceToTFList(in []string) types.List {
 	return listVal
 }
 
-// MergeRestrictionsWithPriorState folds API-derived restrictions values into
-// the prior Terraform state so that server-side defaults for fields the user
-// never configured don't show up as drift on subsequent plans. Mirrors
-// MergeDiskEncryptionWithPriorState.
+// MergeRestrictionsWithPriorState reconciles UEM's response with the user's
+// prior config. internal-ticket removed almost all of what this used to do:
+//   - dropping a sub-block the user didn't configure (row #93 of the B16
+//     audit: never observed live, no source);
+//   - restoring a prior sub-block the API omitted, for every sub-block
+//     except Desktop (row #93; Desktop's restore is (a), kept below, per
+//     R + GGS:43: Desktop is confirmed null on GET unless locked);
+//   - PreserveNull on every leaf field, including the media/CD-DVD block
+//     built from prior state (rows #94/#95: never observed live, and in
+//     tension with the CD/DVD read_only=true validator, which the ruling
+//     does not touch).
+//
+// mapAppleOsXRestrictions's result is now stored directly except for
+// Desktop, which is restored from the prior state when the API omits it.
 func MergeRestrictionsWithPriorState(api, state *profilemodels.RestrictionsModel) *profilemodels.RestrictionsModel {
 	if api == nil {
 		return nil
@@ -689,268 +541,49 @@ func MergeRestrictionsWithPriorState(api, state *profilemodels.RestrictionsModel
 	if state == nil {
 		return api
 	}
-	if state.Applications == nil {
-		api.Applications = nil
-	}
-	if state.Desktop == nil {
-		api.Desktop = nil
-	}
-	if state.Functionality == nil {
-		api.Functionality = nil
-	}
-	if state.Media == nil {
-		api.Media = nil
-	}
-	if state.Preferences == nil {
-		api.Preferences = nil
-	}
-	if state.Sharing == nil {
-		api.Sharing = nil
-	}
-	if state.Widgets == nil {
-		api.Widgets = nil
-	}
-	// Inverse: if the API omits a sub-block the user previously configured
-	// (mappers may collapse empty payloads to nil), keep the prior-state
-	// sub-block so a Read doesn't silently drop user config and produce a
-	// perpetual diff.
-	if api.Applications == nil && state.Applications != nil {
-		api.Applications = state.Applications
-	}
 	if api.Desktop == nil && state.Desktop != nil {
 		api.Desktop = state.Desktop
-	}
-	if api.Functionality == nil && state.Functionality != nil {
-		api.Functionality = state.Functionality
-	}
-	if api.Media == nil && state.Media != nil {
-		api.Media = state.Media
-	}
-	if api.Preferences == nil && state.Preferences != nil {
-		api.Preferences = state.Preferences
-	}
-	if api.Sharing == nil && state.Sharing != nil {
-		api.Sharing = state.Sharing
-	}
-	if api.Widgets == nil && state.Widgets != nil {
-		api.Widgets = state.Widgets
-	}
-	if api.Applications != nil && state.Applications != nil {
-		mergeRestrictionsApplications(api.Applications, state.Applications)
-	}
-	if api.Desktop != nil && state.Desktop != nil {
-		api.Desktop.DesktopPicturePath = PreserveNullString(api.Desktop.DesktopPicturePath, state.Desktop.DesktopPicturePath)
-		api.Desktop.LockDesktopPicture = PreserveNullBool(api.Desktop.LockDesktopPicture, state.Desktop.LockDesktopPicture)
-	}
-	if api.Functionality != nil && state.Functionality != nil {
-		mergeRestrictionsFunctionality(api.Functionality, state.Functionality)
-	}
-	if api.Media != nil && state.Media != nil {
-		mergeRestrictionsMedia(api.Media, state.Media)
-	}
-	if api.Preferences != nil && state.Preferences != nil {
-		mergeRestrictionsPreferences(api.Preferences, state.Preferences)
-	}
-	if api.Sharing != nil && state.Sharing != nil {
-		mergeRestrictionsSharing(api.Sharing, state.Sharing)
-	}
-	if api.Widgets != nil && state.Widgets != nil {
-		api.Widgets.AllowOnlyConfiguredWidgets = PreserveNullBool(api.Widgets.AllowOnlyConfiguredWidgets, state.Widgets.AllowOnlyConfiguredWidgets)
-		api.Widgets.AllowedWidgets = PreserveNullStringList(api.Widgets.AllowedWidgets, state.Widgets.AllowedWidgets)
-	}
-	if api.Applications == nil && api.Desktop == nil && api.Functionality == nil &&
-		api.Media == nil && api.Preferences == nil && api.Sharing == nil && api.Widgets == nil {
-		return nil
 	}
 	return api
 }
 
-func mergeRestrictionsApplications(api, state *profilemodels.RestrictionsApplicationsModel) {
-	api.AllowApplication = PreserveNullStringList(api.AllowApplication, state.AllowApplication)
-	api.AllowFolders = PreserveNullStringList(api.AllowFolders, state.AllowFolders)
-	api.DisallowFolders = PreserveNullStringList(api.DisallowFolders, state.DisallowFolders)
-	api.RestrictWhichApplicationsAreAllowedToLaunch = PreserveNullBool(api.RestrictWhichApplicationsAreAllowedToLaunch, state.RestrictWhichApplicationsAreAllowedToLaunch)
-	if state.AppStore == nil {
-		api.AppStore = nil
-	} else if api.AppStore != nil {
-		api.AppStore.AllowAppStoreAppAdoption = PreserveNullBool(api.AppStore.AllowAppStoreAppAdoption, state.AppStore.AllowAppStoreAppAdoption)
-		api.AppStore.RequireAdminPasswordToInstallOrUpdateApp = PreserveNullBool(api.AppStore.RequireAdminPasswordToInstallOrUpdateApp, state.AppStore.RequireAdminPasswordToInstallOrUpdateApp)
-		api.AppStore.RestrictAppStoreToSoftwareUpdatesOnly = PreserveNullBool(api.AppStore.RestrictAppStoreToSoftwareUpdatesOnly, state.AppStore.RestrictAppStoreToSoftwareUpdatesOnly)
-	}
-	if state.AppleMusic == nil {
-		api.AppleMusic = nil
-	} else if api.AppleMusic != nil {
-		api.AppleMusic.AllowMusicService = PreserveNullBool(api.AppleMusic.AllowMusicService, state.AppleMusic.AllowMusicService)
-	}
-	if state.Camera == nil {
-		api.Camera = nil
-	} else if api.Camera != nil {
-		api.Camera.AllowUseOfBuiltInCamera = PreserveNullBool(api.Camera.AllowUseOfBuiltInCamera, state.Camera.AllowUseOfBuiltInCamera)
-	}
-	if state.GameCentre == nil {
-		api.GameCentre = nil
-	} else if api.GameCentre != nil {
-		api.GameCentre.AllowAddingGameCenterFriends = PreserveNullBool(api.GameCentre.AllowAddingGameCenterFriends, state.GameCentre.AllowAddingGameCenterFriends)
-		api.GameCentre.AllowGameCenterModification = PreserveNullBool(api.GameCentre.AllowGameCenterModification, state.GameCentre.AllowGameCenterModification)
-		api.GameCentre.AllowMultiplayerGaming = PreserveNullBool(api.GameCentre.AllowMultiplayerGaming, state.GameCentre.AllowMultiplayerGaming)
-		api.GameCentre.AllowUseOfGameCenter = PreserveNullBool(api.GameCentre.AllowUseOfGameCenter, state.GameCentre.AllowUseOfGameCenter)
-	}
-	if state.Safari == nil {
-		api.Safari = nil
-	} else if api.Safari != nil {
-		api.Safari.AllowDeprecatedWebKitTls = PreserveNullBool(api.Safari.AllowDeprecatedWebKitTls, state.Safari.AllowDeprecatedWebKitTls)
-		api.Safari.AllowSafariAutoFill = PreserveNullBool(api.Safari.AllowSafariAutoFill, state.Safari.AllowSafariAutoFill)
-	}
-}
+// internal-ticket removed mergeRestrictionsApplications, mergeRestrictionsFunctionality,
+// mergeRestrictionsICloud, mergeRestrictionsMedia, mergeMediaAccessPtr,
+// mergeRestrictionsPreferences, and mergeRestrictionsSharing (rows #90/#93/
+// #94/#95 of the B16 audit). Every restrictions leaf field is now the API
+// value verbatim; nothing here falls back to the prior state, and the
+// media/CD-DVD block is no longer fabricated from it (see the CD/DVD
+// read_only=true validator this used to sit in tension with).
 
-func mergeRestrictionsFunctionality(api, state *profilemodels.RestrictionsFunctionalityModel) {
-	if state.AirPrint == nil {
-		api.AirPrint = nil
-	} else if api.AirPrint != nil {
-		api.AirPrint.AllowAirPrint = PreserveNullBool(api.AirPrint.AllowAirPrint, state.AirPrint.AllowAirPrint)
-		api.AirPrint.AllowAirPrintiBeaconDiscovery = PreserveNullBool(api.AirPrint.AllowAirPrintiBeaconDiscovery, state.AirPrint.AllowAirPrintiBeaconDiscovery)
-		api.AirPrint.ForceAirPrintTrustedTLSRequirement = PreserveNullBool(api.AirPrint.ForceAirPrintTrustedTLSRequirement, state.AirPrint.ForceAirPrintTrustedTLSRequirement)
+// EnsureComputedDefaults fills the General fields the provider has always
+// defaulted when state holds null, EXCEPT for ProfileScope (removed):
+// readGeneralV2IntoState and readGeneralV4IntoState now assign
+// data.ProfileScope unconditionally from UEM's response (setDescriptionFromAPI's
+// sibling for ProfileScope, added under internal-ticket), so after a real Read
+// this field is always a concrete StringValue, never null or unknown —
+// including "", which UEM returns live-confirmed 2026-09-25 on the 26.2 lab
+// tenant (guarded B16 follow-up create) for a profile with no profile_scope
+// configured. Keeping this line would have silently turned that faithful ""
+// into "Production" the moment the field ever did arrive null/unknown (the
+// General payload missing from the response entirely), masking a real gap
+// instead of surfacing it.
+//
+// AssignmentType and IsActive are provider defaults now source-cited:
+// UEM source: AirWatch API/AirWatch.ServiceModel/Profiles/V2/Resources/GeneralPayloadV2Entity.cs:691-707,140,148
+// (canonical Q4). AssignmentType has no server default (an omitted value
+// fails validation, so "Auto" is a provider-only convenience default);
+// IsActive = true is confirmed as the server's own constructor default,
+// unconditionally for every platform. UUID keeps its held default unchanged
+// below (no canonical answer yet for that one — see B16 decision table row
+// #40).
+func EnsureComputedDefaults(data *profilemodels.ProfileResourceModel) {
+	if data.AssignmentType.IsNull() || data.AssignmentType.IsUnknown() {
+		data.AssignmentType = types.StringValue("Auto")
 	}
-	if state.ContentCaching == nil {
-		api.ContentCaching = nil
-	} else if api.ContentCaching != nil {
-		api.ContentCaching.AllowContentCaching = PreserveNullBool(api.ContentCaching.AllowContentCaching, state.ContentCaching.AllowContentCaching)
+	if data.IsActive.IsNull() || data.IsActive.IsUnknown() {
+		data.IsActive = types.BoolValue(true)
 	}
-	if state.ICloud == nil {
-		api.ICloud = nil
-	} else if api.ICloud != nil {
-		mergeRestrictionsICloud(api.ICloud, state.ICloud)
+	if data.UUID.IsNull() || data.UUID.IsUnknown() {
+		data.UUID = types.StringValue("")
 	}
-	if state.Passwords == nil {
-		api.Passwords = nil
-	} else if api.Passwords != nil {
-		api.Passwords.AllowPasswordAutoFill = PreserveNullBool(api.Passwords.AllowPasswordAutoFill, state.Passwords.AllowPasswordAutoFill)
-		api.Passwords.AllowPasswordProximityRequests = PreserveNullBool(api.Passwords.AllowPasswordProximityRequests, state.Passwords.AllowPasswordProximityRequests)
-		api.Passwords.AllowPasswordSharing = PreserveNullBool(api.Passwords.AllowPasswordSharing, state.Passwords.AllowPasswordSharing)
-	}
-	if state.Spotlight == nil {
-		api.Spotlight = nil
-	} else if api.Spotlight != nil {
-		api.Spotlight.AllowSpotlightSuggestions = PreserveNullBool(api.Spotlight.AllowSpotlightSuggestions, state.Spotlight.AllowSpotlightSuggestions)
-	}
-}
-
-func mergeRestrictionsICloud(api, state *profilemodels.RestrictionsICloudModel) {
-	api.AllowAirPrint = PreserveNullBool(api.AllowAirPrint, state.AllowAirPrint)
-	api.AllowAirPrintiBeaconDiscovery = PreserveNullBool(api.AllowAirPrintiBeaconDiscovery, state.AllowAirPrintiBeaconDiscovery)
-	api.AllowCloudDesktopAndDocuments = PreserveNullBool(api.AllowCloudDesktopAndDocuments, state.AllowCloudDesktopAndDocuments)
-	api.AllowDeprecatedWebKitTls = PreserveNullBool(api.AllowDeprecatedWebKitTls, state.AllowDeprecatedWebKitTls)
-	api.AllowICloudFMM = PreserveNullBool(api.AllowICloudFMM, state.AllowICloudFMM)
-	api.AllowIcloudAddressBook = PreserveNullBool(api.AllowIcloudAddressBook, state.AllowIcloudAddressBook)
-	api.AllowIcloudBTMM = PreserveNullBool(api.AllowIcloudBTMM, state.AllowIcloudBTMM)
-	api.AllowIcloudBookmarks = PreserveNullBool(api.AllowIcloudBookmarks, state.AllowIcloudBookmarks)
-	api.AllowIcloudCalendar = PreserveNullBool(api.AllowIcloudCalendar, state.AllowIcloudCalendar)
-	api.AllowIcloudDocumentsAndData = PreserveNullBool(api.AllowIcloudDocumentsAndData, state.AllowIcloudDocumentsAndData)
-	api.AllowIcloudKeychainSync = PreserveNullBool(api.AllowIcloudKeychainSync, state.AllowIcloudKeychainSync)
-	api.AllowIcloudMail = PreserveNullBool(api.AllowIcloudMail, state.AllowIcloudMail)
-	api.AllowIcloudNotes = PreserveNullBool(api.AllowIcloudNotes, state.AllowIcloudNotes)
-	api.AllowIcloudReminders = PreserveNullBool(api.AllowIcloudReminders, state.AllowIcloudReminders)
-	api.AllowPasswordAutoFill = PreserveNullBool(api.AllowPasswordAutoFill, state.AllowPasswordAutoFill)
-	api.AllowPasswordProximityRequests = PreserveNullBool(api.AllowPasswordProximityRequests, state.AllowPasswordProximityRequests)
-	api.AllowPasswordSharing = PreserveNullBool(api.AllowPasswordSharing, state.AllowPasswordSharing)
-	api.AllowUseIcloudPasswordForLocalAccounts = PreserveNullBool(api.AllowUseIcloudPasswordForLocalAccounts, state.AllowUseIcloudPasswordForLocalAccounts)
-	api.ForceAirPrintTrustedTLSRequirement = PreserveNullBool(api.ForceAirPrintTrustedTLSRequirement, state.ForceAirPrintTrustedTLSRequirement)
-}
-
-func mergeRestrictionsMedia(api, state *profilemodels.RestrictionsMediaModel) {
-	api.AutoEjectMedia = PreserveNullBool(api.AutoEjectMedia, state.AutoEjectMedia)
-	mergeMediaAccessPtr(&api.DiskMediaCDs, state.DiskMediaCDs)
-	mergeMediaAccessPtr(&api.DiskMediaDVDs, state.DiskMediaDVDs)
-	mergeMediaAccessPtr(&api.ExternalHardDiskMediaAccess, state.ExternalHardDiskMediaAccess)
-	mergeMediaAccessPtr(&api.HardDiskDvdRam, state.HardDiskDvdRam)
-	mergeMediaAccessPtr(&api.HardDiskImages, state.HardDiskImages)
-	mergeMediaAccessPtr(&api.InternalHardDiskMediaAccess, state.InternalHardDiskMediaAccess)
-	if state.NetworkAccess == nil {
-		api.NetworkAccess = nil
-	} else if api.NetworkAccess != nil {
-		api.NetworkAccess.AirDrop = PreserveNullBool(api.NetworkAccess.AirDrop, state.NetworkAccess.AirDrop)
-	}
-	if state.RecordableDisc == nil {
-		api.RecordableDisc = nil
-	} else {
-		if api.RecordableDisc == nil {
-			api.RecordableDisc = &profilemodels.RestrictionsBurnSupportModel{}
-		}
-		mergeMediaAccessPtr(&api.RecordableDisc.BurnSupport, state.RecordableDisc.BurnSupport)
-	}
-}
-
-func mergeMediaAccessPtr(apiPtr **profilemodels.RestrictionsMediaAccessModel, state *profilemodels.RestrictionsMediaAccessModel) {
-	if state == nil {
-		*apiPtr = nil
-		return
-	}
-	if *apiPtr == nil {
-		*apiPtr = &profilemodels.RestrictionsMediaAccessModel{
-			Allow:        state.Allow,
-			Authenticate: state.Authenticate,
-			ReadOnly:     state.ReadOnly,
-		}
-		return
-	}
-	(*apiPtr).Allow = PreserveNullBool((*apiPtr).Allow, state.Allow)
-	(*apiPtr).Authenticate = PreserveNullBool((*apiPtr).Authenticate, state.Authenticate)
-	(*apiPtr).ReadOnly = PreserveNullBool((*apiPtr).ReadOnly, state.ReadOnly)
-}
-
-func mergeRestrictionsPreferences(api, state *profilemodels.RestrictionsPreferencesModel) {
-	api.Accessibility = PreserveNullBool(api.Accessibility, state.Accessibility)
-	api.AppStore = PreserveNullBool(api.AppStore, state.AppStore)
-	api.Bluetooth = PreserveNullBool(api.Bluetooth, state.Bluetooth)
-	api.CDsAndDVDs = PreserveNullBool(api.CDsAndDVDs, state.CDsAndDVDs)
-	api.DateAndTime = PreserveNullBool(api.DateAndTime, state.DateAndTime)
-	api.DesktopAndScreenSaver = PreserveNullBool(api.DesktopAndScreenSaver, state.DesktopAndScreenSaver)
-	api.DictationAndSpeech = PreserveNullBool(api.DictationAndSpeech, state.DictationAndSpeech)
-	api.Displays = PreserveNullBool(api.Displays, state.Displays)
-	api.Dock = PreserveNullBool(api.Dock, state.Dock)
-	api.EnabledPreferencePanes = PreserveNullBool(api.EnabledPreferencePanes, state.EnabledPreferencePanes)
-	api.EnergySaver = PreserveNullBool(api.EnergySaver, state.EnergySaver)
-	api.Extensions = PreserveNullBool(api.Extensions, state.Extensions)
-	api.FibreChannel = PreserveNullBool(api.FibreChannel, state.FibreChannel)
-	api.FlashPlayer = PreserveNullBool(api.FlashPlayer, state.FlashPlayer)
-	api.General = PreserveNullBool(api.General, state.General)
-	api.Ink = PreserveNullBool(api.Ink, state.Ink)
-	api.InternetAccounts = PreserveNullBool(api.InternetAccounts, state.InternetAccounts)
-	api.Keyboard = PreserveNullBool(api.Keyboard, state.Keyboard)
-	api.LanguageAndText = PreserveNullBool(api.LanguageAndText, state.LanguageAndText)
-	api.MissionControl = PreserveNullBool(api.MissionControl, state.MissionControl)
-	api.MobileMe = PreserveNullBool(api.MobileMe, state.MobileMe)
-	api.Mouse = PreserveNullBool(api.Mouse, state.Mouse)
-	api.Network = PreserveNullBool(api.Network, state.Network)
-	api.Notifications = PreserveNullBool(api.Notifications, state.Notifications)
-	api.ParentalControls = PreserveNullBool(api.ParentalControls, state.ParentalControls)
-	api.PreferenceBehavior = PreserveNullString(api.PreferenceBehavior, state.PreferenceBehavior)
-	api.PrintAndScan = PreserveNullBool(api.PrintAndScan, state.PrintAndScan)
-	api.Profiles = PreserveNullBool(api.Profiles, state.Profiles)
-	api.SecurityAndPrivacy = PreserveNullBool(api.SecurityAndPrivacy, state.SecurityAndPrivacy)
-	api.Sharing = PreserveNullBool(api.Sharing, state.Sharing)
-	api.SoftwareUpdate = PreserveNullBool(api.SoftwareUpdate, state.SoftwareUpdate)
-	api.Sound = PreserveNullBool(api.Sound, state.Sound)
-	api.Spotlight = PreserveNullBool(api.Spotlight, state.Spotlight)
-	api.StartupDisk = PreserveNullBool(api.StartupDisk, state.StartupDisk)
-	api.TimeMachine = PreserveNullBool(api.TimeMachine, state.TimeMachine)
-	api.Trackpad = PreserveNullBool(api.Trackpad, state.Trackpad)
-	api.UsersAndGroups = PreserveNullBool(api.UsersAndGroups, state.UsersAndGroups)
-	api.Xsan = PreserveNullBool(api.Xsan, state.Xsan)
-	api.ICloud = PreserveNullBool(api.ICloud, state.ICloud)
-}
-
-func mergeRestrictionsSharing(api, state *profilemodels.RestrictionsSharingModel) {
-	api.AddtoAperture = PreserveNullBool(api.AddtoAperture, state.AddtoAperture)
-	api.AddtoReadingList = PreserveNullBool(api.AddtoReadingList, state.AddtoReadingList)
-	api.AddtoiPhoto = PreserveNullBool(api.AddtoiPhoto, state.AddtoiPhoto)
-	api.AirDrop = PreserveNullBool(api.AirDrop, state.AirDrop)
-	api.AutomaticallyEnableNewSharingServices = PreserveNullBool(api.AutomaticallyEnableNewSharingServices, state.AutomaticallyEnableNewSharingServices)
-	api.Facebook = PreserveNullBool(api.Facebook, state.Facebook)
-	api.Mail = PreserveNullBool(api.Mail, state.Mail)
-	api.Messages = PreserveNullBool(api.Messages, state.Messages)
-	api.RestrictWhichSharingServicesAreEnabled = PreserveNullBool(api.RestrictWhichSharingServicesAreEnabled, state.RestrictWhichSharingServicesAreEnabled)
-	api.SinaWeibo = PreserveNullBool(api.SinaWeibo, state.SinaWeibo)
-	api.Twitter = PreserveNullBool(api.Twitter, state.Twitter)
-	api.VideoServices = PreserveNullBool(api.VideoServices, state.VideoServices)
 }

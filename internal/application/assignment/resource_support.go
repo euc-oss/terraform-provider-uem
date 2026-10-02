@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"net/http"
 
-	sdk "github.com/euc-oss/terraform-sdk-uem"
+	sdk "github.com/euc-oss/terraform-sdk-uem/v26"
 
 	commonerrors "github.com/euc-oss/terraform-provider-uem/internal/common/errors"
 )

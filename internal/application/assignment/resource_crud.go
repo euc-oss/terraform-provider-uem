@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 
-	sdk "github.com/euc-oss/terraform-sdk-uem"
+	sdk "github.com/euc-oss/terraform-sdk-uem/v26"
 	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
@@ -13,6 +13,8 @@ import (
 
 	tf "github.com/euc-oss/terraform-provider-uem/internal/application/assignment/models"
 	assignmentState "github.com/euc-oss/terraform-provider-uem/internal/application/assignment/state"
+	"github.com/euc-oss/terraform-provider-uem/internal/common/notfound"
+	"github.com/euc-oss/terraform-provider-uem/internal/providerdata"
 )
 
 func (r *applicationAssignmentResource) Configure(ctx context.Context, req resource.ConfigureRequest, resp *resource.ConfigureResponse) {
@@ -32,6 +34,13 @@ func (r *applicationAssignmentResource) Configure(ctx context.Context, req resou
 		} else {
 			r.newAppAssignmentService = defaultAppAssignmentServiceFactory
 		}
+	case *providerdata.ProviderData:
+		if data == nil || data.Client == nil {
+			resp.Diagnostics.AddError("Unexpected Resource Configure Type", "Provider resource data was nil or missing a configured SDK client.")
+			return
+		}
+		r.client = data.Client
+		r.newAppAssignmentService = defaultAppAssignmentServiceFactory
 	case *sdk.Client:
 		// Backward-compatible path for direct unit tests that still pass *sdk.Client.
 		r.client = data
@@ -114,12 +123,15 @@ func (r *applicationAssignmentResource) Read(
 
 	_, result, err := svc.GetAssignmentRuleAsync(ctx, applicationUUID)
 	if err != nil {
-		if isNotFoundAPIError(err) {
-			resp.State.RemoveResource(ctx)
+		if !isNotFoundAPIError(err) {
+			resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Unable to read assignment rule, got error: %s", err))
 			return
 		}
-		resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Unable to read assignment rule, got error: %s", err))
-		return
+		confirmed, ok := r.confirmNotFoundRead(ctx, svc, applicationUUID, resp)
+		if !ok {
+			return
+		}
+		result = confirmed
 	}
 	if result == nil {
 		tflog.Warn(ctx, "assignment read returned no body; preserving minimal state", map[string]any{
@@ -147,6 +159,37 @@ func (r *applicationAssignmentResource) Read(
 	resp.Diagnostics.Append(resp.State.Set(ctx, &data)...)
 
 	tflog.Trace(ctx, "read application assignment resource")
+}
+
+// confirmNotFoundRead runs notfound.Confirm for a Read not-found
+// classification (see internal/common/notfound: this protects against a
+// single flaky not-found response dropping real Terraform state). It
+// returns (confirmed result, true) when Read should continue exactly as it
+// would the original success path; it returns (nil, false) once it has
+// already fully handled the response itself (RemoveResource or a
+// Diagnostics error), in which case the caller must return immediately.
+func (r *applicationAssignmentResource) confirmNotFoundRead(
+	ctx context.Context,
+	svc appAssignmentServiceAPI,
+	applicationUUID string,
+	resp *resource.ReadResponse,
+) (*sdk.AppAssignmentRuleV2Model, bool) {
+	confirmed, stillNotFound, confirmErr := notfound.Confirm(ctx, isNotFoundAPIError, func(ctx context.Context) (*sdk.AppAssignmentRuleV2Model, error) {
+		_, result, err := svc.GetAssignmentRuleAsync(ctx, applicationUUID)
+		return result, err
+	})
+	if confirmErr != nil {
+		resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Unable to read assignment rule, got error: %s", confirmErr))
+		return nil, false
+	}
+	if stillNotFound {
+		resp.State.RemoveResource(ctx)
+		return nil, false
+	}
+	tflog.Warn(ctx, fmt.Sprintf("UEM returned not-found then found for application assignment %s; kept in state", applicationUUID), map[string]any{
+		"application_uuid": applicationUUID,
+	})
+	return confirmed, true
 }
 
 func (r *applicationAssignmentResource) Update(
@@ -182,7 +225,7 @@ func (r *applicationAssignmentResource) Update(
 	_, err = svc.UpdateAssignmentRuleAsync(ctx, applicationUUID, apiBody)
 	if err != nil {
 		if isNotFoundAPIError(err) {
-			resp.State.RemoveResource(ctx)
+			r.confirmNotFoundUpdate(ctx, svc, applicationUUID, resp)
 			return
 		}
 		resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Unable to update assignment rule, got error: %s", err))
@@ -198,6 +241,43 @@ func (r *applicationAssignmentResource) Update(
 		&resp.Diagnostics)
 
 	tflog.Trace(ctx, "updated application assignment resource")
+}
+
+// confirmNotFoundUpdate runs notfound.Confirm for an Update not-found
+// classification (see internal/common/notfound: this protects against a
+// single flaky not-found response dropping real Terraform state). Unlike
+// Read's confirmNotFoundRead, Update never resumes inline: the write that
+// just failed not-found may or may not have already applied on UEM's side,
+// and there is no way to tell from here, so blindly re-issuing the same
+// write is not something this package can call "clean" -- it risks
+// double-applying the update against a live tenant. If the confirming
+// re-GET finds the assignment rule gone, this drops state exactly as it
+// would without notfound.Confirm; if it finds the rule present after all,
+// this surfaces a clear "re-run apply" error and leaves state untouched
+// (the rule is confirmed to still exist, so removing it from state would be
+// wrong).
+func (r *applicationAssignmentResource) confirmNotFoundUpdate(
+	ctx context.Context,
+	svc appAssignmentServiceAPI,
+	applicationUUID string,
+	resp *resource.UpdateResponse,
+) {
+	_, stillNotFound, confirmErr := notfound.Confirm(ctx, isNotFoundAPIError, func(ctx context.Context) (*sdk.AppAssignmentRuleV2Model, error) {
+		_, result, err := svc.GetAssignmentRuleAsync(ctx, applicationUUID)
+		return result, err
+	})
+	if confirmErr != nil {
+		resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Unable to update assignment rule, got error: %s", confirmErr))
+		return
+	}
+	if stillNotFound {
+		resp.State.RemoveResource(ctx)
+		return
+	}
+	tflog.Warn(ctx, fmt.Sprintf("UEM returned not-found then found for application assignment %s during update; re-run apply", applicationUUID), map[string]any{
+		"application_uuid": applicationUUID,
+	})
+	resp.Diagnostics.AddError("Client Error", "UEM returned not-found then found during update; re-run apply")
 }
 
 func (r *applicationAssignmentResource) Delete(ctx context.Context, req resource.DeleteRequest, resp *resource.DeleteResponse) {

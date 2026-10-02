@@ -3,9 +3,12 @@ package state
 import (
 	"context"
 	"strconv"
+	"strings"
 
-	sdk "github.com/euc-oss/terraform-sdk-uem"
+	sdk "github.com/euc-oss/terraform-sdk-uem/v26"
+	"github.com/hashicorp/terraform-plugin-framework/attr"
 	"github.com/hashicorp/terraform-plugin-framework/types"
+	"github.com/hashicorp/terraform-plugin-log/tflog"
 
 	profilemodels "github.com/euc-oss/terraform-provider-uem/internal/profile/models"
 )
@@ -18,8 +21,12 @@ type CredentialItemModel = profilemodels.CredentialItemModel
 type DiskEncryptionModel = profilemodels.DiskEncryptionModel
 type DiskEncryptionAirWatchModel = profilemodels.DiskEncryptionAirWatchModel
 type DiskEncryptionFileVaultModel = profilemodels.DiskEncryptionFileVaultModel
-type DiskEncryptionMCXModel = profilemodels.DiskEncryptionMCXModel
 type GatekeeperModel = profilemodels.GatekeeperModel
+type SystemExtensionsModel = profilemodels.SystemExtensionsModel
+type AllowedSystemExtensionTypeModel = profilemodels.AllowedSystemExtensionTypeModel
+type AllowedSystemExtensionModel = profilemodels.AllowedSystemExtensionModel
+type PrivacyPreferenceModel = profilemodels.PrivacyPreferenceModel
+type AppleEventModel = profilemodels.AppleEventModel
 
 func ReadProfileIntoState(ctx context.Context, data *ProfileResourceModel, result *sdk.ProfileResult) {
 	switch {
@@ -34,8 +41,50 @@ func ReadProfileIntoState(ctx context.Context, data *ProfileResourceModel, resul
 	case result.WindowsRugged != nil:
 		readGeneralV2IntoState(data, result.WindowsRugged.General)
 	case result.Linux != nil:
-		readGeneralV4IntoState(data, result.Linux.General)
+		readGeneralV4IntoState(ctx, data, result.Linux.General)
 	}
+}
+
+// preserveEnumCase keeps whatever case the caller (config/prior state)
+// already had for assignment_type when it case-insensitively matches what
+// the server returned, instead of always taking the server's canonical
+// casing verbatim. This is what actually fixes internal-task's "Provider
+// produced invalid plan" bug (real Terraform core forbids a plan modifier
+// from overriding a value the user configured — see
+// normalizeEnumCaseModifier's removal). Import/no-prior-value case:
+// existing is null/unknown, so the server's canonical value is used as-is.
+// Drift case: existing doesn't EqualFold match the server's value, so the
+// server's (real, changed) value wins and is reflected in state/diff.
+//
+// internal-ticket: profile_scope no longer goes through this helper. internal-task
+// only covers AssignmentType casing (Enum.TryParse ignoreCase:true); there
+// is no equivalent source citation for ProfileScope, so profile_scope now
+// stores UEM's response verbatim instead of preserving prior casing.
+func preserveEnumCase(existing types.String, serverValue string) string {
+	if !existing.IsNull() && !existing.IsUnknown() && strings.EqualFold(existing.ValueString(), serverValue) {
+		return existing.ValueString()
+	}
+	return serverValue
+}
+
+// setDescriptionFromAPI maps the API's Description string onto
+// data.Description verbatim. UEM's Description field is a non-pointer
+// string with omitempty, so "the field was omitted" and "the field was
+// sent as an explicit empty string" are indistinguishable on the wire; both
+// decode to "". internal-ticket removed the prior-state-dependent null/""
+// disambiguation here (row #57 of the B16 audit: never observed live, no
+// source) in favor of storing exactly what the SDK decoded, with no
+// conditioning on the previous state value.
+//
+// EXPECTED DIFF RISK: resource.go's nullWhenConfigNullStringModifier plans
+// description as null when it is removed from HCL. On the post-apply
+// readback after such a removal, UEM's wire value is "" and this function
+// now stores "" (not null), which can trip Terraform's post-apply
+// consistency check ("was cty.NullVal, but now cty.StringVal(\"\")"). No
+// user config can avoid this because the SDK cannot represent the
+// omitted/empty distinction; see the CHANGELOG entry.
+func setDescriptionFromAPI(data *ProfileResourceModel, apiDescription string) {
+	data.Description = types.StringValue(apiDescription)
 }
 
 func readGeneralV2IntoState(data *ProfileResourceModel, g *sdk.GeneralPayloadV2Entity) {
@@ -43,32 +92,42 @@ func readGeneralV2IntoState(data *ProfileResourceModel, g *sdk.GeneralPayloadV2E
 		return
 	}
 	data.Name = types.StringValue(g.Name)
-	data.Description = types.StringValue(g.Description)
-	if g.AssignmentType != "" {
-		data.AssignmentType = types.StringValue(g.AssignmentType)
-	}
-	if g.ProfileScope != "" {
-		data.ProfileScope = types.StringValue(g.ProfileScope)
-	}
+	setDescriptionFromAPI(data, g.Description)
+	// internal-ticket: the "only assign when non-empty" guards used to leave the
+	// prior AssignmentType/ProfileScope value in place whenever UEM's wire
+	// value was "" (row #58 of the B16 audit: never observed live). Both are
+	// now assigned unconditionally so an empty wire value is reflected as an
+	// empty string in state rather than silently keeping a stale value.
+	data.AssignmentType = types.StringValue(preserveEnumCase(data.AssignmentType, g.AssignmentType))
+	data.ProfileScope = types.StringValue(g.ProfileScope)
 	if g.IsActive != nil {
 		data.IsActive = types.BoolValue(*g.IsActive)
 	}
 	if g.ProfileUUID != "" {
 		data.UUID = types.StringValue(g.ProfileUUID)
 	}
-	if g.ProfileContext != "" && IsValidProfileContext(g.ProfileContext) {
+	// internal-ticket: no longer requires ProfileContext to be "User" or
+	// "Device" before storing it (row #59: never observed live that UEM
+	// sends anything else, no source for silently ignoring an unrecognized
+	// value and keeping the prior one).
+	if g.ProfileContext != "" {
 		data.ProfileContext = types.StringValue(g.ProfileContext)
 	}
 	if g.ManagedLocationGroupID != nil {
 		data.OrgGroupID = types.StringValue(strconv.Itoa(*g.ManagedLocationGroupID))
 	}
-	// Map assigned/excluded smart groups from API to state
+	// Map assigned/excluded smart groups from API to state. internal-ticket:
+	// entries whose SmartGroupID is nil are no longer dropped (row #61); they
+	// are stored as a null list element so the response's entry count is
+	// preserved.
 	data.AssignedSmartGroups = nil
 	if len(g.AssignedSmartGroups) > 0 {
 		data.AssignedSmartGroups = make([]types.String, 0, len(g.AssignedSmartGroups))
 		for _, sg := range g.AssignedSmartGroups {
 			if sg.SmartGroupID != nil {
 				data.AssignedSmartGroups = append(data.AssignedSmartGroups, types.StringValue(strconv.Itoa(*sg.SmartGroupID)))
+			} else {
+				data.AssignedSmartGroups = append(data.AssignedSmartGroups, types.StringNull())
 			}
 		}
 	}
@@ -78,22 +137,28 @@ func readGeneralV2IntoState(data *ProfileResourceModel, g *sdk.GeneralPayloadV2E
 		for _, sg := range g.ExcludedSmartGroups {
 			if sg.SmartGroupID != nil {
 				data.ExcludedSmartGroups = append(data.ExcludedSmartGroups, types.StringValue(strconv.Itoa(*sg.SmartGroupID)))
+			} else {
+				data.ExcludedSmartGroups = append(data.ExcludedSmartGroups, types.StringNull())
 			}
 		}
 	}
 }
 
-func readGeneralV4IntoState(data *ProfileResourceModel, g *sdk.GeneralPayloadV4Entity) {
+func readGeneralV4IntoState(ctx context.Context, data *ProfileResourceModel, g *sdk.GeneralPayloadV4Entity) {
 	if g == nil {
 		return
 	}
 	data.Name = types.StringValue(g.Name)
-	data.Description = types.StringValue(g.Description)
+	setDescriptionFromAPI(data, g.Description)
 	if g.AssignmentType != "" {
-		data.AssignmentType = types.StringValue(g.AssignmentType)
+		data.AssignmentType = types.StringValue(preserveEnumCase(data.AssignmentType, g.AssignmentType))
 	}
-	if g.ProfileScope != "" {
-		data.ProfileScope = types.StringValue(g.ProfileScope)
+	if g.ProfileScope != nil {
+		if name, ok := profileScopeNameFromWireValue(*g.ProfileScope); ok {
+			data.ProfileScope = types.StringValue(preserveEnumCase(data.ProfileScope, name))
+		} else {
+			tflog.Warn(ctx, "Unmapped Linux profile_scope wire value; leaving prior state unchanged", map[string]any{"wire_value": *g.ProfileScope})
+		}
 	}
 	if g.IsActive != nil {
 		data.IsActive = types.BoolValue(*g.IsActive)
@@ -111,42 +176,75 @@ func readGeneralV4IntoState(data *ProfileResourceModel, g *sdk.GeneralPayloadV4E
 	}
 }
 
+// profileScopeWireNames maps the V4 (Linux) wire integer ProfileScope value
+// back to its canonical name, mirroring platform.profileScopeWireValues.
+// See internal-task: Production=1 (live-confirmed against as<internal-env>.eng.example.com),
+// Staging=2, Both=3 (UNVERIFIED live — no Linux profile existed in the
+// accessible org group scope to confirm against a real server response;
+// these follow the canonical enum ordering from the C# server source,
+// release/26.2.0.0, per doctrine-quirk-17).
+var profileScopeWireNames = map[int]string{
+	1: "Production",
+	2: "Staging",
+	3: "Both",
+}
+
+func profileScopeNameFromWireValue(v int) (string, bool) {
+	name, ok := profileScopeWireNames[v]
+	return name, ok
+}
+
 func readAppleOsXIntoState(ctx context.Context, data *ProfileResourceModel, ent *sdk.AppleOsXDeviceProfileEntityV2) {
 	readGeneralV2IntoState(data, ent.General)
 
-	priorPasscode := data.Passcode
+	// internal-ticket: Passcode/NetworkList/CredentialsList/DiskEncryption/
+	// Gatekeeper/PrivacyPreferences are stored straight from what UEM
+	// returned, with no fallback to the prior state. See the B16 audit rows
+	// #62-64, #66-67, #69-70, #74, #85-88, #97.
 	data.Passcode = mapAppleOsXPasscode(ent.Passcode)
-	mergePasscodeWithPriorState(data.Passcode, priorPasscode)
 
 	data.CustomSettingsList = mapCustomSettingsListAppleOsX(data.CustomSettingsList, ent.CustomSettingsList)
 
-	priorNetworks := data.NetworkList
-	mappedNetworks := mapAppleOsXNetworkList(ent.NetworkList)
-	if mappedNetworks == nil && priorNetworks != nil {
-		mappedNetworks = priorNetworks[:0]
-	}
-	data.NetworkList = MergeNetworkListWithPriorState(mappedNetworks, priorNetworks)
+	data.NetworkList = carryNetworkPasswords(mapAppleOsXNetworkList(ent.NetworkList), data.NetworkList)
 
-	priorCreds := data.CredentialsList
-	mappedCreds := mapAppleOsXCredentialsList(ent.CredentialsList)
-	if mappedCreds == nil && priorCreds != nil {
-		mappedCreds = priorCreds[:0]
-	}
-	data.CredentialsList = MergeCredentialsListWithPriorState(mappedCreds, priorCreds)
+	data.CredentialsList = carryCredentialSecrets(mapAppleOsXCredentialsList(ent.CredentialsList), data.CredentialsList)
 
-	priorDE := data.DiskEncryption
-	data.DiskEncryption = MergeDiskEncryptionWithPriorState(mapAppleOsXDiskEncryption(ent.DiskEncryption), priorDE)
+	data.DiskEncryption = mapAppleOsXDiskEncryption(ent.DiskEncryption)
 
-	priorGK := data.Gatekeeper
-	data.Gatekeeper = MergeGatekeeperWithPriorState(mapAppleOsXGatekeeper(ent.GateKeeper), priorGK)
+	data.Gatekeeper = mapAppleOsXGatekeeper(ent.GateKeeper)
 
 	priorR := data.Restrictions
 	data.Restrictions = MergeRestrictionsWithPriorState(mapAppleOsXRestrictions(ent.Restrictions), priorR)
+
+	priorSE := data.SystemExtensions
+	data.SystemExtensions = MergeSystemExtensionsWithPriorState(mapAppleOsXSystemExtensions(ent.SystemExtensions, priorSE), priorSE)
+
+	data.PrivacyPreferences = mapAppleOsXPrivacyPreferences(ent.PrivacyPreferences)
+
+	// Stored straight from what UEM returned, like the other lists above.
+	data.ScepList = mapAppleOsXScepList(ent.ScepList)
+	data.WebClipsList = mapAppleOsXWebClipsList(ent.WebClipsList)
+	data.VpnList = carryVPNSecrets(mapVPNItemList(ent.VpnList), data.VpnList)
+	data.EasMicrosoftOutlook = carryEasMicrosoftOutlookPassword(mapEasMicrosoftOutlookPtr(ent.EasMicrosoftOutlook), data.EasMicrosoftOutlook)
+	data.CustomAttributes = mapCustomAttributeList(ent.CustomAttributes)
+	data.KernelExtension = mapKernelExtensionPtr(ent.KernelExtension)
 	_ = ctx
 }
 
+// internal-ticket: no longer gated on appleOsXPasscodeHasContent (row #63 of the
+// B16 audit: never observed live that UEM omits this block, no source) and
+// no longer merged with the prior state afterward (row #62: never observed
+// live that UEM sends null for AutoLock/MaximumPasscodeAge/
+// MinimumNumberOfComplexCharacters, no source). The block is now present in
+// state whenever UEM's response includes the pointer, with each field
+// mapped from the server value as-is.
+//
+// EXPECTED DIFF RISK: if UEM always returns this struct non-nil (even for a
+// profile with no configured passcode policy), every macOS/iOS profile will
+// now show an empty `passcode {}` block in state instead of a nil one. This
+// was not confirmed either way by the audit.
 func mapAppleOsXPasscode(p *sdk.AppleOsXPasscodePayloadEntityV2) *PasscodeModel {
-	if p == nil || !appleOsXPasscodeHasContent(p) {
+	if p == nil {
 		return nil
 	}
 	return &PasscodeModel{
@@ -161,35 +259,6 @@ func mapAppleOsXPasscode(p *sdk.AppleOsXPasscodePayloadEntityV2) *PasscodeModel 
 		MaxFailedAttempts:                intPtrToNumericString(p.MaxFailedAttempts),
 		PinHistory:                       intPtrToNumericString(p.PinHistory),
 		MinutesUntilFailedLoginReset:     int64PtrToTF(p.MinutesUntilFailedLoginReset),
-	}
-}
-
-func appleOsXPasscodeHasContent(p *sdk.AppleOsXPasscodePayloadEntityV2) bool {
-	return p.RequirePasscodeOnDevice != nil ||
-		p.AllowSimpleValue != nil ||
-		p.RequireAlphanumericValue != nil ||
-		p.MinimumPasscodeLength != nil ||
-		p.MinimumNumberOfComplexCharacters != "" ||
-		p.MaximumPasscodeAge != "" ||
-		p.AutoLock != "" ||
-		p.GracePeriod != nil ||
-		p.MaxFailedAttempts != nil ||
-		p.PinHistory != nil ||
-		p.MinutesUntilFailedLoginReset != nil
-}
-
-func mergePasscodeWithPriorState(api, state *PasscodeModel) {
-	if api == nil || state == nil {
-		return
-	}
-	if (api.AutoLock.IsNull() || api.AutoLock.IsUnknown()) && !state.AutoLock.IsUnknown() {
-		api.AutoLock = state.AutoLock
-	}
-	if (api.MaximumPasscodeAge.IsNull() || api.MaximumPasscodeAge.IsUnknown()) && !state.MaximumPasscodeAge.IsUnknown() {
-		api.MaximumPasscodeAge = state.MaximumPasscodeAge
-	}
-	if (api.MinimumNumberOfComplexCharacters.IsNull() || api.MinimumNumberOfComplexCharacters.IsUnknown()) && !state.MinimumNumberOfComplexCharacters.IsUnknown() {
-		api.MinimumNumberOfComplexCharacters = state.MinimumNumberOfComplexCharacters
 	}
 }
 
@@ -257,14 +326,14 @@ func mapAppleOsXNetworkList(items []sdk.AppleOsXNetworkPayloadEntityV2) []Networ
 		if n.OuterIdentity != "" {
 			out.OuterIdentity = types.StringValue(n.OuterIdentity)
 		}
-		// Password / UserPassword / ProxyPassword are intentionally not read
-		// from the API. UEM either omits them, echoes back an obfuscated
-		// placeholder, or returns the original value; any of those breaks
-		// Terraform's post-apply consistency check ("inconsistent values for
-		// sensitive attribute") because the planned config value would no
-		// longer match the response. Leave them null here and let
-		// MergeNetworkListWithPriorState (KeepStateString) carry the user's
-		// plan/state value forward unchanged.
+		// Password / UserPassword / ProxyPassword are write-only: they are
+		// not read from UEM. carryNetworkPasswords puts back the user's
+		// configured values from prior state after mapping.
+		// Live-confirmed 2026-09-25 on the 26.2 lab tenant (uem_profile
+		// AppleOsX network_list, WPA2 create): UEM does not echo the
+		// configured PSK, and reading it made apply fail with
+		// "inconsistent values for sensitive attribute". Evidence:
+		// internal-design-doc
 		setTrueBool(&out.UsePAC, n.UsePAC)
 		setTrueBool(&out.AllowTwoRANDs, n.AllowTwoRANDs)
 		if len(n.TrustedCertificates) > 0 {
@@ -280,7 +349,9 @@ func mapAppleOsXNetworkList(items []sdk.AppleOsXNetworkPayloadEntityV2) []Networ
 		if n.ProxyServer != "" {
 			out.ProxyServer = types.StringValue(n.ProxyServer)
 		}
-		if n.ProxyServerPort != nil && *n.ProxyServerPort != 0 {
+		// internal-ticket: a server-returned 0 is no longer treated as "unset"
+		// (row #67 of the B16 audit).
+		if n.ProxyServerPort != nil {
 			out.ProxyServerPort = types.Int64Value(int64(*n.ProxyServerPort))
 		}
 		if n.ProxyUsername != "" {
@@ -321,13 +392,12 @@ func mapAppleOsXCredentialsList(items []sdk.AppleOsXCredentialPayloadEntityV2) [
 		if c.CertificateID != nil {
 			out.CertificateID = types.Int64Value(int64(*c.CertificateID))
 		}
-		// CA + template come back as 0 for Upload credentials (the field is
-		// only meaningful for DefinedCertificateAuthority). Treat 0 as
-		// "unset" so the consumer's null config doesn't perpetually diff.
-		if c.CertificateAuthority != nil && *c.CertificateAuthority != 0 {
+		// internal-ticket: a server-returned 0 is no longer treated as "unset"
+		// for CA/template (row #69 of the B16 audit).
+		if c.CertificateAuthority != nil {
 			out.CertificateAuthority = types.Int64Value(int64(*c.CertificateAuthority))
 		}
-		if c.CertificateTemplate != nil && *c.CertificateTemplate != 0 {
+		if c.CertificateTemplate != nil {
 			out.CertificateTemplate = types.Int64Value(int64(*c.CertificateTemplate))
 		}
 		if c.AllowAccessToAllApplications != nil {
@@ -348,18 +418,16 @@ func mapAppleOsXDiskEncryption(de *sdk.AppleOsXDiskEncryptionPayloadEntityV2) *D
 	aw := mapAppleOsXDiskEncryptionAirWatch(de.DiskEncryptionAirWatch)
 	fv := mapAppleOsXDiskEncryptionFileVault(de.DiskEncryptionFileVault2)
 	mcx := mapAppleOsXDiskEncryptionMCX(de.DiskEncryptionMCX)
-	if aw == nil && fv == nil && mcx == nil {
+	if aw == nil && fv == nil && mcx.IsNull() {
 		return nil
 	}
 	return &DiskEncryptionModel{AirWatch: aw, FileVault: fv, MCX: mcx}
 }
 
+// internal-ticket: no longer collapses an all-zero-fields struct to nil (row #70
+// of the B16 audit); only a nil pointer maps to nil now.
 func mapAppleOsXDiskEncryptionAirWatch(aw *sdk.AppleOsXDiskEncryptionAirWatchPayloadEntityV2) *DiskEncryptionAirWatchModel {
 	if aw == nil {
-		return nil
-	}
-	empty := *aw == (sdk.AppleOsXDiskEncryptionAirWatchPayloadEntityV2{})
-	if empty {
 		return nil
 	}
 	return &DiskEncryptionAirWatchModel{
@@ -371,7 +439,7 @@ func mapAppleOsXDiskEncryptionAirWatch(aw *sdk.AppleOsXDiskEncryptionAirWatchPay
 		EncryptionNotificationMessage:               stringToTF(aw.EncryptionNotificationMessage),
 		EncryptionMaxNotifyAttempts:                 int64PtrToTF(aw.EncryptionMaxNotifyAttempts),
 		EncryptionNotificationRetryIntervalInHours:  int64PtrToTF(aw.EncryptionNotificationRetryIntervalInHours),
-		EncryptionActionAfterLastNotification:       numericStringToInt64TF(aw.EncryptionActionAfterLastNotification),
+		EncryptionActionAfterLastNotification:       encryptionActionAfterLastNotificationToInt64TF(aw.EncryptionActionAfterLastNotification),
 		EnableRecoveryKey:                           boolPtrToTF(aw.EnableRecoveryKey),
 		RecoveryKeyNotificationTitle:                stringToTF(aw.RecoveryKeyNotificationTitle),
 		RecoveryKeyNotificationMessage:              stringToTF(aw.RecoveryKeyNotificationMessage),
@@ -386,12 +454,10 @@ func mapAppleOsXDiskEncryptionAirWatch(aw *sdk.AppleOsXDiskEncryptionAirWatchPay
 	}
 }
 
+// internal-ticket: no longer collapses an all-zero-fields struct to nil (row #70
+// of the B16 audit); only a nil pointer maps to nil now.
 func mapAppleOsXDiskEncryptionFileVault(fv *sdk.AppleOsXDiskEncryptionFileVault2PayloadEntityV2) *DiskEncryptionFileVaultModel {
 	if fv == nil {
-		return nil
-	}
-	empty := *fv == (sdk.AppleOsXDiskEncryptionFileVault2PayloadEntityV2{})
-	if empty {
 		return nil
 	}
 	return &DiskEncryptionFileVaultModel{
@@ -399,26 +465,39 @@ func mapAppleOsXDiskEncryptionFileVault(fv *sdk.AppleOsXDiskEncryptionFileVault2
 		ShowRecoveryKey:                boolPtrToTF(fv.ShowRecoveryKey),
 		RecoveryType:                   int64PtrToTF(fv.RecoveryType),
 		FileVaultEnterpriseCertificate: stringToTF(fv.FileVaultEnterpriseCertificate),
-		FileVaultUser:                  numericStringToInt64TF(fv.FileVaultUser),
+		FileVaultUser:                  fileVaultUserToInt64TF(fv.FileVaultUser),
 		Username:                       stringToTF(fv.Username),
-		PromptToEnableFileVaultAt:      numericStringToInt64TF(fv.PromptToEnableFileVaultAt),
+		PromptToEnableFileVaultAt:      promptToEnableFileVaultAtToInt64TF(fv.PromptToEnableFileVaultAt),
 		NumberOfTimesUserCanBypass:     int64PtrToTF(fv.NumberOfTimesUserCanBypass),
 	}
 }
 
-func mapAppleOsXDiskEncryptionMCX(mcx *sdk.AppleOsXDiskEncryptionMCXPayloadEntityV2) *DiskEncryptionMCXModel {
-	if mcx == nil || mcx.DestroyFVKeyOnStandby == nil {
-		return nil
+// mapAppleOsXDiskEncryptionMCX maps UEM's DiskEncryptionMCX into the mcx
+// types.Object. A nil API value (UEM genuinely sent no MCX section) maps to
+// ObjectNull. A non-nil API value always maps to a known ObjectValueMust,
+// even when its own DestroyFVKeyOnStandby pointer is nil -- the leaf then
+// maps to BoolNull, verbatim, rather than collapsing the whole object away
+// (B42 follow-up: collapsing a present-but-partial object to nil is what
+// let a genuinely unknown create-time plan get confused with an
+// API-omitted section; the two are now kept distinct).
+func mapAppleOsXDiskEncryptionMCX(mcx *sdk.AppleOsXDiskEncryptionMCXPayloadEntityV2) types.Object {
+	if mcx == nil {
+		return types.ObjectNull(profilemodels.DiskEncryptionMCXAttrTypes)
 	}
-	return &DiskEncryptionMCXModel{DestroyFVKeyOnStandby: types.BoolValue(*mcx.DestroyFVKeyOnStandby)}
+	return types.ObjectValueMust(profilemodels.DiskEncryptionMCXAttrTypes, map[string]attr.Value{
+		"destroy_fv_key_on_standby": boolPtrToTF(mcx.DestroyFVKeyOnStandby),
+	})
 }
 
 // mapAppleOsXGatekeeper hydrates a GatekeeperModel from the parent value-typed
-// SDK field. UEM always returns this block populated for macOS profiles, even
-// when the caller never sent it; the caller is expected to filter that out via
-// MergeGatekeeperWithPriorState so unmanaged fields don't leak into state.
+// SDK field. internal-ticket: no longer gated on appleOsXGatekeeperHasContent,
+// and the caller no longer runs the result through
+// MergeGatekeeperWithPriorState (both row #74 of the B16 audit: never
+// observed live, no source). A nil pointer maps to nil; otherwise every
+// field UEM returned is stored, including any server-side defaults for
+// fields the caller never configured.
 func mapAppleOsXGatekeeper(g *sdk.MacOsGatekeeperPayloadV2Entity) *GatekeeperModel {
-	if g == nil || !appleOsXGatekeeperHasContent(g) {
+	if g == nil {
 		return nil
 	}
 	return &GatekeeperModel{
@@ -432,26 +511,115 @@ func mapAppleOsXGatekeeper(g *sdk.MacOsGatekeeperPayloadV2Entity) *GatekeeperMod
 	}
 }
 
-func appleOsXGatekeeperHasContent(g *sdk.MacOsGatekeeperPayloadV2Entity) bool {
-	return g.AllowAutoUnlock != nil ||
-		g.AllowFingerprintForUnlock != nil ||
-		g.AllowHandoff != nil ||
-		g.AllowScreenCapture != nil ||
-		g.EnableAppSoftwareUpdateDelay != nil ||
-		g.EnableSoftwareUpdateDelay != nil ||
-		g.EnforcedSoftwareUpdateDelay != nil
+// mapAppleOsXSystemExtensions hydrates a SystemExtensionsModel from the
+// parent value-typed SDK field. Confirmed live 2026-09-25 (as<internal-env>):
+// UEM populates this block once any system_extensions config is applied, and
+// always injects a "*" (global team identifier) entry into
+// AllowedSystemExtensionTypes representing the implicit deny-all-others
+// default policy — even when the user never configured one. Prior carries
+// the caller's own prior state/config so mapAllowedSystemExtensionTypes can
+// tell a genuine user-configured "*" entry apart from that server default.
+func mapAppleOsXSystemExtensions(s *sdk.MacOsSystemExtensionsPayloadV2Model, prior *SystemExtensionsModel) *SystemExtensionsModel {
+	if s == nil || !appleOsXSystemExtensionsHasContent(s) {
+		return nil
+	}
+	var priorTypes []AllowedSystemExtensionTypeModel
+	if prior != nil {
+		priorTypes = prior.AllowedSystemExtensionTypes
+	}
+	return &SystemExtensionsModel{
+		AllowUserOverrides:          boolPtrToTF(s.AllowUserOverrides),
+		AllowedSystemExtensionTypes: mapAllowedSystemExtensionTypes(s.AllowedSystemExtensionTypes, priorTypes),
+		AllowedSystemExtensions:     mapAllowedSystemExtensions(s.AllowedSystemExtensions),
+	}
+}
+
+func appleOsXSystemExtensionsHasContent(s *sdk.MacOsSystemExtensionsPayloadV2Model) bool {
+	return s.AllowUserOverrides != nil ||
+		len(s.AllowedSystemExtensionTypes) > 0 ||
+		len(s.AllowedSystemExtensions) > 0
+}
+
+// mapAllowedSystemExtensionTypes drops UEM's server-synthesized "*" entry
+// (TeamIdentifier "*" with every type denied, the implicit deny-all-others
+// default UEM injects alongside any explicit team entry) unless prior already
+// carries an explicit "*" entry of its own, i.e. the user configured one.
+// Dropping it keeps state matching config so plans stay clean; keeping a
+// user-configured one preserves round-trip fidelity for that entry. A "*"
+// entry that allows any type is never the server default, so it is always
+// kept: on import (no prior) dropping it would leave it out of the onboarded
+// HCL, and the next update would then silently delete it from the profile.
+func mapAllowedSystemExtensionTypes(items []sdk.MacOsAllowedSystemExtensionTypesV2Model, prior []AllowedSystemExtensionTypeModel) []AllowedSystemExtensionTypeModel {
+	keepWildcard := hasExplicitWildcardTypeEntry(prior)
+	result := make([]AllowedSystemExtensionTypeModel, 0, len(items))
+	for i := range items {
+		it := &items[i]
+		if !keepWildcard && isServerDefaultWildcardType(it) {
+			continue
+		}
+		result = append(result, AllowedSystemExtensionTypeModel{
+			TeamIdentifier:                     stringToTF(it.TeamIdentifier),
+			AllowDriverExtensionType:           boolPtrToTF(it.AllowDriverExtensionType),
+			AllowEndpointSecurityExtensionType: boolPtrToTF(it.AllowEndpointSecurityExtensionType),
+			AllowNetworkExtensionType:          boolPtrToTF(it.AllowNetworkExtensionType),
+		})
+	}
+	if len(result) == 0 {
+		return nil
+	}
+	return result
+}
+
+// isServerDefaultWildcardType reports whether it has the shape of UEM's
+// synthetic entry: TeamIdentifier "*" and no extension type allowed.
+func isServerDefaultWildcardType(it *sdk.MacOsAllowedSystemExtensionTypesV2Model) bool {
+	return it.TeamIdentifier == "*" &&
+		!boolPtrTrue(it.AllowDriverExtensionType) &&
+		!boolPtrTrue(it.AllowEndpointSecurityExtensionType) &&
+		!boolPtrTrue(it.AllowNetworkExtensionType)
+}
+
+func boolPtrTrue(b *bool) bool { return b != nil && *b }
+
+func hasExplicitWildcardTypeEntry(items []AllowedSystemExtensionTypeModel) bool {
+	for _, it := range items {
+		if !it.TeamIdentifier.IsNull() && it.TeamIdentifier.ValueString() == "*" {
+			return true
+		}
+	}
+	return false
+}
+
+// mapAllowedSystemExtensions needs no wildcard-drop treatment: confirmed live
+// 2026-09-25 (as<internal-env>) that UEM does NOT inject a synthetic entry into this
+// list the way it does for AllowedSystemExtensionTypes -- it echoed back
+// exactly the one entry that was configured, nothing more.
+func mapAllowedSystemExtensions(items []sdk.MacOsAllowedSystemExtensionV2Model) []AllowedSystemExtensionModel {
+	if len(items) == 0 {
+		return nil
+	}
+	result := make([]AllowedSystemExtensionModel, 0, len(items))
+	for i := range items {
+		it := &items[i]
+		result = append(result, AllowedSystemExtensionModel{
+			BundleIdentifier: stringToTF(it.BundleIdentifier),
+			TeamIdentifier:   stringToTF(it.TeamIdentifier),
+		})
+	}
+	return result
 }
 
 func readAppleiOSIntoState(_ context.Context, data *ProfileResourceModel, ent *sdk.AppleDeviceProfileV2Entity) {
 	readGeneralV2IntoState(data, ent.General)
-	priorPasscode := data.Passcode
 	data.Passcode = mapAppleiOSPasscode(ent.Passcode)
-	mergePasscodeWithPriorState(data.Passcode, priorPasscode)
 	data.CustomSettingsList = mapCustomSettingsListAppleiOS(data.CustomSettingsList, ent.CustomSettingsList)
 }
 
+// internal-ticket: see mapAppleOsXPasscode's doc comment -- the same
+// hasContent-gate and prior-state merge removal (rows #62, #63) applies
+// here for iOS.
 func mapAppleiOSPasscode(p *sdk.ApplePasscodePayloadV2Entity) *PasscodeModel {
-	if p == nil || !appleiOSPasscodeHasContent(p) {
+	if p == nil {
 		return nil
 	}
 	return &PasscodeModel{
@@ -467,19 +635,6 @@ func mapAppleiOSPasscode(p *sdk.ApplePasscodePayloadV2Entity) *PasscodeModel {
 		PinHistory:                       stringToTF(p.PasscodeHistory),
 		MinutesUntilFailedLoginReset:     types.Int64Null(),
 	}
-}
-
-func appleiOSPasscodeHasContent(p *sdk.ApplePasscodePayloadV2Entity) bool {
-	return p.RequirePasscodeOnDevice != nil ||
-		p.AllowSimpleValue != nil ||
-		p.RequireAlphanumericValue != nil ||
-		p.MinimumPasscodeLength != nil ||
-		p.MinimumNumberOfComplexCharacters != nil ||
-		p.MaximumPasscodeAge != "" ||
-		p.AutoLock != "" ||
-		p.GracePeriodForDeviceLock != nil ||
-		p.MaximumNumberOfFailedAttempts != "" ||
-		p.PasscodeHistory != ""
 }
 
 func mapCustomSettingsListAppleiOS(prior []CustomSettingsItemModel, items []sdk.AppleCustomSettingsPayloadV2Entity) []CustomSettingsItemModel {
@@ -552,15 +707,68 @@ func intPtrToNumericString(p *int) types.String {
 	return types.StringValue(strconv.Itoa(*p))
 }
 
-func numericStringToInt64TF(s string) types.Int64 {
-	if s == "" {
-		return types.Int64Null()
+// fileVaultUserNumbers is the read-side inverse of the builder's
+// fileVaultUserNames map (platform/builders.go): the complete set of
+// MacOsFileVaultUser enum name strings UEM's GET response returns (canonical
+// rules Q3/Q4, StringEnumConverter), each mapped back to the schema's Int64
+// encoding.
+var fileVaultUserNumbers = map[string]int64{
+	"CurrentOrNextLoginUser": 1,
+	"SpecificUser":           2,
+}
+
+// promptToEnableFileVaultAtNumbers is the read-side inverse of the
+// builder's promptToEnableFileVaultAtNames map: the complete set of
+// MacOsTimeOfPromptToEnableFileVault enum name strings.
+var promptToEnableFileVaultAtNumbers = map[string]int64{
+	"BothLoginAndLogout": 1,
+	"LogoutOnly":         2,
+	"LoginOnly":          3,
+}
+
+// encryptionActionAfterLastNotificationNumbers is the read-side inverse of
+// the builder's encryptionActionAfterLastNotificationNames map: the complete
+// set of MacOsEncryptionAction enum name strings.
+var encryptionActionAfterLastNotificationNumbers = map[string]int64{
+	"ForceLogout": 1,
+	"DoNothing":   2,
+}
+
+// enumNameToInt64TF is a reader for the three StringEnumConverter-backed
+// FileVault2/AirWatch fields (filevault_user, prompt_to_enable_filevault_at,
+// encryption_action_after_last_notification). UEM's GET response returns the
+// enum name string (e.g. "SpecificUser"), matched via names; an unmapped or
+// unrecognized name maps to null. internal-ticket: no longer also accepts a raw
+// numeric string (row #73 of the B16 audit: the tolerant fallback was for
+// defensive/pre-fix stored state, not confirmed live UEM behavior).
+func enumNameToInt64TF(s string, names map[string]int64) types.Int64 {
+	if n, ok := names[s]; ok {
+		return types.Int64Value(n)
 	}
-	n, err := strconv.ParseInt(s, 10, 64)
-	if err != nil {
-		return types.Int64Null()
-	}
-	return types.Int64Value(n)
+	return types.Int64Null()
+}
+
+// fileVaultUserToInt64TF maps disk_encryption.filevault2.filevault_user from
+// one of the SDK's live-validated MacOsFileVaultUser enum name strings. Any
+// other value maps to null.
+func fileVaultUserToInt64TF(s string) types.Int64 {
+	return enumNameToInt64TF(s, fileVaultUserNumbers)
+}
+
+// promptToEnableFileVaultAtToInt64TF maps
+// disk_encryption.filevault2.prompt_to_enable_filevault_at from one of the
+// SDK's live-validated MacOsTimeOfPromptToEnableFileVault enum name strings.
+// Any other value maps to null.
+func promptToEnableFileVaultAtToInt64TF(s string) types.Int64 {
+	return enumNameToInt64TF(s, promptToEnableFileVaultAtNumbers)
+}
+
+// encryptionActionAfterLastNotificationToInt64TF maps
+// disk_encryption.airwatch.encryption_action_after_last_notification from
+// one of the SDK's live-validated MacOsEncryptionAction enum name strings.
+// Any other value maps to null.
+func encryptionActionAfterLastNotificationToInt64TF(s string) types.Int64 {
+	return enumNameToInt64TF(s, encryptionActionAfterLastNotificationNumbers)
 }
 
 // setTrueBool writes the API-supplied boolean into state when present.
@@ -576,11 +784,21 @@ func setTrueBool(dst *types.Bool, src *bool) {
 
 // ----- Restrictions (macOS) -----
 
+// mapAppleOsXRestrictions and every sub-mapper below it in this file map a
+// nil pointer to nil, and otherwise return a populated struct -- even one
+// whose fields are all null/zero. internal-ticket removed the "collapse an
+// empty/all-zero result back to nil" post-hoc checks that used to run after
+// mapping (row #90 of the B16 audit: never observed live that UEM omits a
+// sub-block whose pointer it sends, no source), so block presence is now
+// determined solely by whether UEM's response included the pointer. The
+// Widgets sub-mapper is the one exception in this tree: it keeps its
+// empty-collapse check, which is (a)-confirmed by GGS:44 and out of scope
+// here.
 func mapAppleOsXRestrictions(r *sdk.AppleOsXRestrictionsPayloadEntityV2) *profilemodels.RestrictionsModel {
 	if r == nil {
 		return nil
 	}
-	out := &profilemodels.RestrictionsModel{
+	return &profilemodels.RestrictionsModel{
 		Applications:  mapAppleOsXRestrictionsApplications(r.Applications),
 		Desktop:       mapAppleOsXRestrictionsDesktop(r.Desktop),
 		Functionality: mapAppleOsXRestrictionsFunctionality(r.Functionality),
@@ -589,18 +807,13 @@ func mapAppleOsXRestrictions(r *sdk.AppleOsXRestrictionsPayloadEntityV2) *profil
 		Sharing:       mapAppleOsXRestrictionsSharing(r.Sharing),
 		Widgets:       mapAppleOsXRestrictionsWidgets(r.Widgets),
 	}
-	if out.Applications == nil && out.Desktop == nil && out.Functionality == nil &&
-		out.Media == nil && out.Preferences == nil && out.Sharing == nil && out.Widgets == nil {
-		return nil
-	}
-	return out
 }
 
 func mapAppleOsXRestrictionsApplications(a *sdk.AppleOsXRestrictionApplicationsPayloadEntityV2) *profilemodels.RestrictionsApplicationsModel {
 	if a == nil {
 		return nil
 	}
-	m := &profilemodels.RestrictionsApplicationsModel{
+	return &profilemodels.RestrictionsApplicationsModel{
 		AllowApplication: stringSliceToTFList(a.AllowApplication),
 		AllowFolders:     stringSliceToTFList(a.AllowFolders),
 		DisallowFolders:  stringSliceToTFList(a.DisallowFolders),
@@ -611,17 +824,10 @@ func mapAppleOsXRestrictionsApplications(a *sdk.AppleOsXRestrictionApplicationsP
 		GameCentre: mapAppleOsXRestrictionsGameCentre(a.GameCentre),
 		Safari:     mapAppleOsXRestrictionsSafari(a.Safari),
 	}
-	if m.AllowApplication.IsNull() && m.AllowFolders.IsNull() && m.DisallowFolders.IsNull() &&
-		m.RestrictWhichApplicationsAreAllowedToLaunch.IsNull() &&
-		m.AppStore == nil && m.AppleMusic == nil && m.Camera == nil &&
-		m.GameCentre == nil && m.Safari == nil {
-		return nil
-	}
-	return m
 }
 
 func mapAppleOsXRestrictionsAppStore(a *sdk.AppleOsXRestrictionAppStorePayloadEntityV2) *profilemodels.RestrictionsAppStoreModel {
-	if a == nil || *a == (sdk.AppleOsXRestrictionAppStorePayloadEntityV2{}) {
+	if a == nil {
 		return nil
 	}
 	return &profilemodels.RestrictionsAppStoreModel{
@@ -632,7 +838,7 @@ func mapAppleOsXRestrictionsAppStore(a *sdk.AppleOsXRestrictionAppStorePayloadEn
 }
 
 func mapAppleOsXRestrictionsAppleMusic(a *sdk.AppleOsXRestrictionAppleMusicPayloadEntityV2) *profilemodels.RestrictionsAppleMusicModel {
-	if a == nil || a.AllowMusicService == nil {
+	if a == nil {
 		return nil
 	}
 	return &profilemodels.RestrictionsAppleMusicModel{
@@ -641,7 +847,7 @@ func mapAppleOsXRestrictionsAppleMusic(a *sdk.AppleOsXRestrictionAppleMusicPaylo
 }
 
 func mapAppleOsXRestrictionsCamera(a *sdk.AppleOsXRestrictionCameraPayloadEntityV2) *profilemodels.RestrictionsCameraModel {
-	if a == nil || a.AllowUseOfBuiltInCamera == nil {
+	if a == nil {
 		return nil
 	}
 	return &profilemodels.RestrictionsCameraModel{
@@ -650,7 +856,7 @@ func mapAppleOsXRestrictionsCamera(a *sdk.AppleOsXRestrictionCameraPayloadEntity
 }
 
 func mapAppleOsXRestrictionsGameCentre(a *sdk.AppleOsXRestrictionGameCentrePayloadEntityV2) *profilemodels.RestrictionsGameCentreModel {
-	if a == nil || *a == (sdk.AppleOsXRestrictionGameCentrePayloadEntityV2{}) {
+	if a == nil {
 		return nil
 	}
 	return &profilemodels.RestrictionsGameCentreModel{
@@ -662,7 +868,7 @@ func mapAppleOsXRestrictionsGameCentre(a *sdk.AppleOsXRestrictionGameCentrePaylo
 }
 
 func mapAppleOsXRestrictionsSafari(a *sdk.AppleOsXRestrictionSafariPayloadEntityV2) *profilemodels.RestrictionsSafariModel {
-	if a == nil || *a == (sdk.AppleOsXRestrictionSafariPayloadEntityV2{}) {
+	if a == nil {
 		return nil
 	}
 	return &profilemodels.RestrictionsSafariModel{
@@ -675,36 +881,27 @@ func mapAppleOsXRestrictionsDesktop(a *sdk.AppleOsXRestrictionDesktopPayloadEnti
 	if a == nil {
 		return nil
 	}
-	m := &profilemodels.RestrictionsDesktopModel{
+	return &profilemodels.RestrictionsDesktopModel{
 		DesktopPicturePath: stringToTF(a.DesktopPicturePath),
 		LockDesktopPicture: boolPtrToTF(a.LockDesktopPicture),
 	}
-	if m.DesktopPicturePath.IsNull() && m.LockDesktopPicture.IsNull() {
-		return nil
-	}
-	return m
 }
 
 func mapAppleOsXRestrictionsFunctionality(a *sdk.AppleOsXRestrictionFunctionalityPayloadEntityV2) *profilemodels.RestrictionsFunctionalityModel {
 	if a == nil {
 		return nil
 	}
-	m := &profilemodels.RestrictionsFunctionalityModel{
+	return &profilemodels.RestrictionsFunctionalityModel{
 		AirPrint:       mapAppleOsXRestrictionsAirPrint(a.AirPrint),
 		ContentCaching: mapAppleOsXRestrictionsContentCaching(a.ContentCaching),
 		ICloud:         mapAppleOsXRestrictionsICloud(a.ICloud),
 		Passwords:      mapAppleOsXRestrictionsPasswords(a.Passwords),
 		Spotlight:      mapAppleOsXRestrictionsSpotlight(a.Spotlight),
 	}
-	if m.AirPrint == nil && m.ContentCaching == nil && m.ICloud == nil &&
-		m.Passwords == nil && m.Spotlight == nil {
-		return nil
-	}
-	return m
 }
 
 func mapAppleOsXRestrictionsAirPrint(a *sdk.AppleOsXRestrictionAirPrintPayloadEntityV2) *profilemodels.RestrictionsAirPrintModel {
-	if a == nil || *a == (sdk.AppleOsXRestrictionAirPrintPayloadEntityV2{}) {
+	if a == nil {
 		return nil
 	}
 	return &profilemodels.RestrictionsAirPrintModel{
@@ -715,7 +912,7 @@ func mapAppleOsXRestrictionsAirPrint(a *sdk.AppleOsXRestrictionAirPrintPayloadEn
 }
 
 func mapAppleOsXRestrictionsContentCaching(a *sdk.AppleOsXRestrictionContentCachingPayloadEntityV2) *profilemodels.RestrictionsContentCachingModel {
-	if a == nil || a.AllowContentCaching == nil {
+	if a == nil {
 		return nil
 	}
 	return &profilemodels.RestrictionsContentCachingModel{
@@ -724,7 +921,7 @@ func mapAppleOsXRestrictionsContentCaching(a *sdk.AppleOsXRestrictionContentCach
 }
 
 func mapAppleOsXRestrictionsICloud(a *sdk.AppleOsXRestrictionICloudPayloadEntityV2) *profilemodels.RestrictionsICloudModel {
-	if a == nil || *a == (sdk.AppleOsXRestrictionICloudPayloadEntityV2{}) {
+	if a == nil {
 		return nil
 	}
 	return &profilemodels.RestrictionsICloudModel{
@@ -751,7 +948,7 @@ func mapAppleOsXRestrictionsICloud(a *sdk.AppleOsXRestrictionICloudPayloadEntity
 }
 
 func mapAppleOsXRestrictionsPasswords(a *sdk.AppleOsXRestrictionPasswordsPayloadEntityV2) *profilemodels.RestrictionsPasswordsModel {
-	if a == nil || *a == (sdk.AppleOsXRestrictionPasswordsPayloadEntityV2{}) {
+	if a == nil {
 		return nil
 	}
 	return &profilemodels.RestrictionsPasswordsModel{
@@ -762,7 +959,7 @@ func mapAppleOsXRestrictionsPasswords(a *sdk.AppleOsXRestrictionPasswordsPayload
 }
 
 func mapAppleOsXRestrictionsSpotlight(a *sdk.AppleOsXRestrictionSpotlightPayloadEntityV2) *profilemodels.RestrictionsSpotlightModel {
-	if a == nil || a.AllowSpotlightSuggestions == nil {
+	if a == nil {
 		return nil
 	}
 	return &profilemodels.RestrictionsSpotlightModel{
@@ -771,7 +968,7 @@ func mapAppleOsXRestrictionsSpotlight(a *sdk.AppleOsXRestrictionSpotlightPayload
 }
 
 func mapAppleOsXMediaAccess(a *sdk.AppleOsXMediaAccessEntityV2) *profilemodels.RestrictionsMediaAccessModel {
-	if a == nil || *a == (sdk.AppleOsXMediaAccessEntityV2{}) {
+	if a == nil {
 		return nil
 	}
 	return &profilemodels.RestrictionsMediaAccessModel{
@@ -794,21 +991,15 @@ func mapAppleOsXRestrictionsMedia(a *sdk.AppleOsXRestrictionMediaPayloadEntityV2
 		HardDiskImages:              mapAppleOsXMediaAccess(a.HardDiskImages),
 		InternalHardDiskMediaAccess: mapAppleOsXMediaAccess(a.InternalHardDiskMediaAccess),
 	}
-	if a.NetworkAccess != nil && a.NetworkAccess.AirDrop != nil {
+	if a.NetworkAccess != nil {
 		m.NetworkAccess = &profilemodels.RestrictionsNetworkAccessModel{
 			AirDrop: boolPtrToTF(a.NetworkAccess.AirDrop),
 		}
 	}
 	if a.RecordableDisc != nil {
-		if burn := mapAppleOsXMediaAccess(a.RecordableDisc.BurnSupport); burn != nil {
-			m.RecordableDisc = &profilemodels.RestrictionsBurnSupportModel{BurnSupport: burn}
+		m.RecordableDisc = &profilemodels.RestrictionsBurnSupportModel{
+			BurnSupport: mapAppleOsXMediaAccess(a.RecordableDisc.BurnSupport),
 		}
-	}
-	if m.AutoEjectMedia.IsNull() && m.DiskMediaCDs == nil && m.DiskMediaDVDs == nil &&
-		m.ExternalHardDiskMediaAccess == nil && m.HardDiskDvdRam == nil &&
-		m.HardDiskImages == nil && m.InternalHardDiskMediaAccess == nil &&
-		m.NetworkAccess == nil && m.RecordableDisc == nil {
-		return nil
 	}
 	return m
 }
@@ -858,30 +1049,11 @@ func mapAppleOsXRestrictionsPreferences(a *sdk.AppleOsXRestrictionPreferencesPay
 		Xsan:                   boolPtrToTF(a.Xsan),
 		ICloud:                 boolPtrToTF(a.ICloud),
 	}
-	if preferencesModelIsEmpty(m) {
-		return nil
-	}
 	return m
 }
 
-func preferencesModelIsEmpty(m *profilemodels.RestrictionsPreferencesModel) bool {
-	return m.Accessibility.IsNull() && m.AppStore.IsNull() && m.Bluetooth.IsNull() &&
-		m.CDsAndDVDs.IsNull() && m.DateAndTime.IsNull() && m.DesktopAndScreenSaver.IsNull() &&
-		m.DictationAndSpeech.IsNull() && m.Displays.IsNull() && m.Dock.IsNull() &&
-		m.EnabledPreferencePanes.IsNull() && m.EnergySaver.IsNull() && m.Extensions.IsNull() &&
-		m.FibreChannel.IsNull() && m.FlashPlayer.IsNull() && m.General.IsNull() &&
-		m.Ink.IsNull() && m.InternetAccounts.IsNull() && m.Keyboard.IsNull() &&
-		m.LanguageAndText.IsNull() && m.MissionControl.IsNull() && m.MobileMe.IsNull() &&
-		m.Mouse.IsNull() && m.Network.IsNull() && m.Notifications.IsNull() &&
-		m.ParentalControls.IsNull() && m.PreferenceBehavior.IsNull() && m.PrintAndScan.IsNull() &&
-		m.Profiles.IsNull() && m.SecurityAndPrivacy.IsNull() && m.Sharing.IsNull() &&
-		m.SoftwareUpdate.IsNull() && m.Sound.IsNull() && m.Spotlight.IsNull() &&
-		m.StartupDisk.IsNull() && m.TimeMachine.IsNull() && m.Trackpad.IsNull() &&
-		m.UsersAndGroups.IsNull() && m.Xsan.IsNull() && m.ICloud.IsNull()
-}
-
 func mapAppleOsXRestrictionsSharing(a *sdk.AppleOsXRestrictionSharingPayloadEntityV2) *profilemodels.RestrictionsSharingModel {
-	if a == nil || *a == (sdk.AppleOsXRestrictionSharingPayloadEntityV2{}) {
+	if a == nil {
 		return nil
 	}
 	return &profilemodels.RestrictionsSharingModel{
@@ -900,6 +1072,70 @@ func mapAppleOsXRestrictionsSharing(a *sdk.AppleOsXRestrictionSharingPayloadEnti
 	}
 }
 
+// mapAppleOsXPrivacyPreferences hydrates the PrivacyPreferences (PPPC) list
+// from the parent value-typed SDK field. Identities is already omitempty on
+// the wire, so an absent block and an empty list are the same nil case --
+// unlike GateKeeper/SystemExtensions there is no separate "hasContent" gate
+// needed here.
+func mapAppleOsXPrivacyPreferences(p *sdk.MacOsPrivacyPreferencesPayloadV2Model) []PrivacyPreferenceModel {
+	if p == nil || len(p.Identities) == 0 {
+		return nil
+	}
+	result := make([]PrivacyPreferenceModel, 0, len(p.Identities))
+	for i := range p.Identities {
+		result = append(result, mapPrivacyPreferenceIdentity(&p.Identities[i]))
+	}
+	return result
+}
+
+func mapPrivacyPreferenceIdentity(it *sdk.MacOsPrivacyPreferencesV2Model) PrivacyPreferenceModel {
+	return PrivacyPreferenceModel{
+		Identifier:                   stringToTF(it.Identifier),
+		IdentifierType:               stringToTF(it.IdentifierType),
+		CodeRequirement:              stringToTF(it.CodeRequirement),
+		Comment:                      stringToTF(it.Comment),
+		AppleEventsList:              mapAppleEventsList(it.AppleEventsList),
+		StaticCode:                   boolPtrToTF(it.StaticCode),
+		Accessibility:                stringToTF(it.Accessibility),
+		AddressBook:                  stringToTF(it.AddressBook),
+		Calendar:                     stringToTF(it.Calendar),
+		Camera:                       stringToTF(it.Camera),
+		FileProviderPresence:         stringToTF(it.FileProviderPresence),
+		ListenEvent:                  stringToTF(it.ListenEvent),
+		MediaLibrary:                 stringToTF(it.MediaLibrary),
+		Microphone:                   stringToTF(it.Microphone),
+		Photos:                       stringToTF(it.Photos),
+		PostEvent:                    stringToTF(it.PostEvent),
+		Reminders:                    stringToTF(it.Reminders),
+		ScreenCapture:                stringToTF(it.ScreenCapture),
+		SpeechRecognition:            stringToTF(it.SpeechRecognition),
+		SystemPolicyAllFiles:         stringToTF(it.SystemPolicyAllFiles),
+		SystemPolicyDesktopFolder:    stringToTF(it.SystemPolicyDesktopFolder),
+		SystemPolicyDocumentsFolder:  stringToTF(it.SystemPolicyDocumentsFolder),
+		SystemPolicyDownloadsFolder:  stringToTF(it.SystemPolicyDownloadsFolder),
+		SystemPolicyNetworkVolumes:   stringToTF(it.SystemPolicyNetworkVolumes),
+		SystemPolicyRemovableVolumes: stringToTF(it.SystemPolicyRemovableVolumes),
+		SystemPolicySysAdminFiles:    stringToTF(it.SystemPolicySysAdminFiles),
+	}
+}
+
+func mapAppleEventsList(items []sdk.AppleEventV2) []AppleEventModel {
+	if len(items) == 0 {
+		return nil
+	}
+	result := make([]AppleEventModel, 0, len(items))
+	for i := range items {
+		it := &items[i]
+		result = append(result, AppleEventModel{
+			CodeRequirement: stringToTF(it.CodeRequirement),
+			Identifier:      stringToTF(it.Identifier),
+			IdentifierType:  stringToTF(it.IdentifierType),
+			Permission:      stringToTF(it.Permission),
+		})
+	}
+	return result
+}
+
 func mapAppleOsXRestrictionsWidgets(a *sdk.AppleOsXRestrictionWidgetPayloadEntityV2) *profilemodels.RestrictionsWidgetsModel {
 	if a == nil {
 		return nil
@@ -912,4 +1148,110 @@ func mapAppleOsXRestrictionsWidgets(a *sdk.AppleOsXRestrictionWidgetPayloadEntit
 		return nil
 	}
 	return m
+}
+
+// carryNetworkPasswords copies the write-only network secrets (password,
+// user_password, proxy_password) from prior state into the freshly mapped
+// list, matched by list position, because UEM never returns them (see the
+// evidence note in mapAppleOsXNetworkList). Only these three fields are
+// carried; every other network field is stored exactly as UEM returns it.
+// With no prior state (import) they stay null, so imported config omits
+// them and plans clean.
+func carryNetworkPasswords(apiList, prior []NetworkItemModel) []NetworkItemModel {
+	for i := range apiList {
+		if i >= len(prior) {
+			break
+		}
+		// knownOrNull: on create the prior is the plan, where an unset
+		// (Computed) password is unknown.
+		apiList[i].Password = knownOrNull(prior[i].Password)
+		apiList[i].UserPassword = knownOrNull(prior[i].UserPassword)
+		apiList[i].ProxyPassword = knownOrNull(prior[i].ProxyPassword)
+	}
+	return apiList
+}
+
+// carryCredentialSecrets copies the write-only credential secrets
+// (certificate_payload, certificate_password) from prior state, because UEM
+// never returns them at all. It matches by credential_name first and falls
+// back to list position. Every other field -- including
+// certificate_authority, certificate_template,
+// allow_access_to_all_applications and key_is_extractable -- is stored
+// exactly as UEM returns it: UEM does echo those four (live-confirmed
+// 2026-09-25: 0, 0, false, true when unset), so per the project's
+// faithfulness rule (carry only what UEM does not echo; everything else is
+// read back as-is) they belong in the schema's own Optional+Computed
+// UseStateForUnknown handling (resource.go), not in this carry function.
+// Carrying them here would hide real drift on those four fields. With no
+// prior state (import) the two secrets stay null.
+//
+// Live-confirmed 2026-09-25 on the 26.2 lab tenant (uem_profile AppleOsX
+// create with one Upload credential): apply failed with
+// "credentials_list: inconsistent values for sensitive attribute" while the
+// secrets were not carried. Evidence: the guarded B16 follow-up live
+// run on 2026-09-25 (see the B16 gate records).
+func carryCredentialSecrets(apiList, prior []CredentialItemModel) []CredentialItemModel {
+	byName := make(map[string]CredentialItemModel, len(prior))
+	for _, p := range prior {
+		if key, ok := CredentialKey(p); ok {
+			byName[key] = p
+		}
+	}
+	for i := range apiList {
+		p, ok := CredentialItemModel{}, false
+		if key, keyed := CredentialKey(apiList[i]); keyed {
+			p, ok = byName[key]
+		}
+		if !ok && i < len(prior) {
+			p, ok = prior[i], true
+		}
+		if !ok {
+			continue
+		}
+		apiList[i].CertificatePayload = p.CertificatePayload
+		apiList[i].CertificatePassword = p.CertificatePassword
+	}
+	return apiList
+}
+
+// mapAppleOsXScepList hydrates scep_list from UEM's read, field for field.
+func mapAppleOsXScepList(items []sdk.AppleOsXScepPayloadEntityV2) []profilemodels.ScepItemModel {
+	if len(items) == 0 {
+		return nil
+	}
+	result := make([]profilemodels.ScepItemModel, 0, len(items))
+	for i := range items {
+		it := &items[i]
+		out := profilemodels.ScepItemModel{
+			Name:                    stringToTF(it.Name),
+			CredentialSource:        stringToTF(it.CredentialSource),
+			CertificateAuthorityID:  int64PtrToTF(it.CertificateAuthorityID),
+			CertificateTemplateID:   int64PtrToTF(it.CertificateTemplateID),
+			AllowExportFromKeyChain: boolPtrToTF(it.AllowExportFromKeyChain),
+		}
+		if it.IdentityPreference != nil && len(it.IdentityPreference.Names) > 0 {
+			out.IdentityPreference = &profilemodels.ScepIdentityPreferenceModel{Names: stringSliceToTFList(it.IdentityPreference.Names)}
+		}
+		result = append(result, out)
+	}
+	return result
+}
+
+// mapAppleOsXWebClipsList hydrates web_clips_list from UEM's read, field for
+// field.
+func mapAppleOsXWebClipsList(items []sdk.MacOsWebClipsPayloadV2Entity) []profilemodels.WebClipItemModel {
+	if len(items) == 0 {
+		return nil
+	}
+	result := make([]profilemodels.WebClipItemModel, 0, len(items))
+	for i := range items {
+		it := &items[i]
+		result = append(result, profilemodels.WebClipItemModel{
+			Label:            stringToTF(it.Label),
+			URL:              stringToTF(it.URL),
+			ShowInAppCatalog: boolPtrToTF(it.ShowInAppCatalog),
+			Icon:             int64PtrToTF(it.Icon),
+		})
+	}
+	return result
 }

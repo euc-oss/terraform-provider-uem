@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"sync"
@@ -14,14 +15,15 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	resourceSchema "github.com/hashicorp/terraform-plugin-framework/resource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
+	"github.com/hashicorp/terraform-plugin-framework/tfsdk"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/hashicorp/terraform-plugin-go/tftypes"
 
 	commonerrors "github.com/euc-oss/terraform-provider-uem/internal/common/errors"
 	profilemodels "github.com/euc-oss/terraform-provider-uem/internal/profile/models"
 	profilestate "github.com/euc-oss/terraform-provider-uem/internal/profile/state"
-	sdk "github.com/euc-oss/terraform-sdk-uem"
-	
+	sdk "github.com/euc-oss/terraform-sdk-uem/v26"
 )
 
 // --- NewProfileResource tests ---
@@ -111,6 +113,208 @@ func TestProfileResourceSchema(t *testing.T) {
 			t.Error("expected 'platform' to have plan modifiers (RequiresReplace)")
 		}
 	}
+}
+
+// TestProfileResourceSchema_TopLevelBlocksClearOnRemoval pins the u3a wiring:
+// every managed top-level block carries exactly one plan modifier, the
+// null-when-config-null one, so removing it from the configuration plans null
+// (and the payload is deleted at apply) instead of keeping the prior state.
+func TestProfileResourceSchema_TopLevelBlocksClearOnRemoval(t *testing.T) {
+	t.Parallel()
+	r := &ProfileResource{}
+	var resp resource.SchemaResponse
+	r.Schema(context.Background(), resource.SchemaRequest{}, &resp)
+	s := resp.Schema
+
+	checkOnly := func(name string, mods []any, want any) {
+		t.Helper()
+		if len(mods) != 1 {
+			t.Errorf("%s: want exactly 1 plan modifier (%T), got %d: %v", name, want, len(mods), mods)
+			return
+		}
+		if gotT, wantT := fmt.Sprintf("%T", mods[0]), fmt.Sprintf("%T", want); gotT != wantT {
+			t.Errorf("%s: plan modifier = %s, want %s", name, gotT, wantT)
+		}
+	}
+	for _, name := range []string{"passcode", "disk_encryption", "gatekeeper", "restrictions"} {
+		a, ok := s.Attributes[name].(resourceSchema.SingleNestedAttribute)
+		if !ok {
+			t.Fatalf("%s: not a SingleNestedAttribute", name)
+		}
+		mods := make([]any, 0, len(a.PlanModifiers))
+		for _, m := range a.PlanModifiers {
+			mods = append(mods, m)
+		}
+		checkOnly(name, mods, nullWhenConfigNullObjectModifier{})
+	}
+	for _, name := range []string{"custom_settings_list", "network_list", "credentials_list"} {
+		a, ok := s.Attributes[name].(resourceSchema.ListNestedAttribute)
+		if !ok {
+			t.Fatalf("%s: not a ListNestedAttribute", name)
+		}
+		mods := make([]any, 0, len(a.PlanModifiers))
+		for _, m := range a.PlanModifiers {
+			mods = append(mods, m)
+		}
+		checkOnly(name, mods, nullWhenConfigNullListModifier{})
+	}
+	a, ok := s.Attributes["description"].(resourceSchema.StringAttribute)
+	if !ok {
+		t.Fatal("description: not a StringAttribute")
+	}
+	mods := make([]any, 0, len(a.PlanModifiers))
+	for _, m := range a.PlanModifiers {
+		mods = append(mods, m)
+	}
+	checkOnly("description", mods, descriptionPlanModifier{})
+}
+
+// --- credentials_list echoed-fields tests (B16 follow-up: faithful readback) ---
+
+// credentialsListAttributes returns the credentials_list nested schema
+// attributes, for pinning the certificate_authority/certificate_template/
+// allow_access_to_all_applications/key_is_extractable wiring below.
+func credentialsListAttributes(t *testing.T) map[string]resourceSchema.Attribute {
+	t.Helper()
+	r := &ProfileResource{}
+	var resp resource.SchemaResponse
+	r.Schema(context.Background(), resource.SchemaRequest{}, &resp)
+	credentialsList, ok := resp.Schema.Attributes["credentials_list"].(resourceSchema.ListNestedAttribute)
+	if !ok {
+		t.Fatalf("credentials_list is not a ListNestedAttribute: %T", resp.Schema.Attributes["credentials_list"])
+	}
+	return credentialsList.NestedObject.Attributes
+}
+
+// TestProfileResourceSchema_CredentialsListEchoedFieldsAreComputed pins the
+// faithful-readback fix (B16 follow-up): certificate_authority,
+// certificate_template, allow_access_to_all_applications and
+// key_is_extractable are attributes UEM echoes back on every read
+// (live-confirmed 2026-09-25: 0, 0, false, true when unset), so they must be
+// Optional+Computed -- an unset config value plans unknown and takes UEM's
+// readback, instead of being pinned to a hard-coded null (plain Optional,
+// the pre-fix bug) or silently carried from prior state (which would hide
+// real drift; see the reverted af93677f3). This test fails if Computed is
+// ever reverted on any of the four.
+func TestProfileResourceSchema_CredentialsListEchoedFieldsAreComputed(t *testing.T) {
+	t.Parallel()
+	nested := credentialsListAttributes(t)
+
+	for _, name := range []string{
+		"certificate_authority", "certificate_template",
+		"allow_access_to_all_applications", "key_is_extractable",
+	} {
+		a, ok := nested[name]
+		if !ok {
+			t.Fatalf("%s: missing from credentials_list nested schema", name)
+		}
+		if !a.IsOptional() {
+			t.Errorf("%s: want Optional = true, got false", name)
+		}
+		if !a.IsComputed() {
+			t.Errorf("%s: want Computed = true, got false", name)
+		}
+	}
+}
+
+// TestProfileResourceSchema_CredentialsListEchoedFields_NoPerpetualDiffWhenUnset
+// runs the actual schema-wired PlanModifiers for each of the four echoed
+// fields with state holding UEM's previously-read-back values and config
+// holding null (config omitted, matching every plan after the first), and
+// asserts the plan comes out equal to state -- i.e. no change is planned.
+// Within a list-nested attribute UseStateForUnknown on the leaves needs the
+// resource to already have prior state for this attribute path (it does
+// nothing on Create, where req.State.Raw is null); a minimal non-null
+// tfsdk.State is enough to exercise that branch, since UseStateForUnknown
+// only inspects req.State.Raw.IsNull(), req.PlanValue and req.ConfigValue.
+func TestProfileResourceSchema_CredentialsListEchoedFields_NoPerpetualDiffWhenUnset(t *testing.T) {
+	t.Parallel()
+	nested := credentialsListAttributes(t)
+	nonNullState := tfsdk.State{Raw: tftypes.NewValue(tftypes.Bool, true)}
+
+	t.Run("certificate_authority stays at UEM's 0", func(t *testing.T) {
+		a, ok := nested["certificate_authority"].(resourceSchema.Int64Attribute)
+		if !ok {
+			t.Fatalf("certificate_authority is not an Int64Attribute: %T", nested["certificate_authority"])
+		}
+		req := planmodifier.Int64Request{
+			ConfigValue: types.Int64Null(),
+			StateValue:  types.Int64Value(0),
+			PlanValue:   types.Int64Unknown(),
+			State:       nonNullState,
+		}
+		resp := &planmodifier.Int64Response{PlanValue: req.PlanValue}
+		for _, m := range a.PlanModifiers {
+			m.PlanModifyInt64(context.Background(), req, resp)
+			req.PlanValue = resp.PlanValue
+		}
+		if !resp.PlanValue.Equal(types.Int64Value(0)) {
+			t.Errorf("planned %v, want state's 0 (no perpetual diff)", resp.PlanValue)
+		}
+	})
+
+	t.Run("certificate_template stays at UEM's 0", func(t *testing.T) {
+		a, ok := nested["certificate_template"].(resourceSchema.Int64Attribute)
+		if !ok {
+			t.Fatalf("certificate_template is not an Int64Attribute: %T", nested["certificate_template"])
+		}
+		req := planmodifier.Int64Request{
+			ConfigValue: types.Int64Null(),
+			StateValue:  types.Int64Value(0),
+			PlanValue:   types.Int64Unknown(),
+			State:       nonNullState,
+		}
+		resp := &planmodifier.Int64Response{PlanValue: req.PlanValue}
+		for _, m := range a.PlanModifiers {
+			m.PlanModifyInt64(context.Background(), req, resp)
+			req.PlanValue = resp.PlanValue
+		}
+		if !resp.PlanValue.Equal(types.Int64Value(0)) {
+			t.Errorf("planned %v, want state's 0 (no perpetual diff)", resp.PlanValue)
+		}
+	})
+
+	t.Run("allow_access_to_all_applications stays at UEM's false", func(t *testing.T) {
+		a, ok := nested["allow_access_to_all_applications"].(resourceSchema.BoolAttribute)
+		if !ok {
+			t.Fatalf("allow_access_to_all_applications is not a BoolAttribute: %T", nested["allow_access_to_all_applications"])
+		}
+		req := planmodifier.BoolRequest{
+			ConfigValue: types.BoolNull(),
+			StateValue:  types.BoolValue(false),
+			PlanValue:   types.BoolUnknown(),
+			State:       nonNullState,
+		}
+		resp := &planmodifier.BoolResponse{PlanValue: req.PlanValue}
+		for _, m := range a.PlanModifiers {
+			m.PlanModifyBool(context.Background(), req, resp)
+			req.PlanValue = resp.PlanValue
+		}
+		if !resp.PlanValue.Equal(types.BoolValue(false)) {
+			t.Errorf("planned %v, want state's false (no perpetual diff)", resp.PlanValue)
+		}
+	})
+
+	t.Run("key_is_extractable stays at UEM's true", func(t *testing.T) {
+		a, ok := nested["key_is_extractable"].(resourceSchema.BoolAttribute)
+		if !ok {
+			t.Fatalf("key_is_extractable is not a BoolAttribute: %T", nested["key_is_extractable"])
+		}
+		req := planmodifier.BoolRequest{
+			ConfigValue: types.BoolNull(),
+			StateValue:  types.BoolValue(true),
+			PlanValue:   types.BoolUnknown(),
+			State:       nonNullState,
+		}
+		resp := &planmodifier.BoolResponse{PlanValue: req.PlanValue}
+		for _, m := range a.PlanModifiers {
+			m.PlanModifyBool(context.Background(), req, resp)
+			req.PlanValue = resp.PlanValue
+		}
+		if !resp.PlanValue.Equal(types.BoolValue(true)) {
+			t.Errorf("planned %v, want state's true (no perpetual diff)", resp.PlanValue)
+		}
+	})
 }
 
 // --- Configure() tests ---
@@ -803,7 +1007,7 @@ func TestProfileResourceCreate_APIError(t *testing.T) {
 
 	handler := func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusInternalServerError)
+		w.WriteHeader(http.StatusBadRequest)
 		_ = json.NewEncoder(w).Encode(map[string]string{"message": "server error"})
 	}
 
@@ -857,7 +1061,7 @@ func TestProfileResourceRead(t *testing.T) {
 				"Name":                   "Read Profile",
 				"Description":            "Read description",
 				"AssignmentType":         "Optional",
-				"ProfileScope":           "Test",
+				"ProfileScope":           "Staging",
 				"ManagedLocationGroupID": 14165,
 				"IsActive":               false,
 				"ProfileUuid":            "read-uuid",
@@ -1054,7 +1258,12 @@ func TestProfileResourceRead_WithPasscode(t *testing.T) {
 // MinimumNumberOfComplexCharacters from the GET response, the Read function
 // preserves those values from the prior Terraform state instead of zeroing
 // them out and causing a perpetual plan diff.
-func TestProfileResourceRead_PasscodeFieldsPreservedFromPriorState(t *testing.T) {
+// internal-ticket removed mergePasscodeWithPriorState (row #62 of the B16
+// audit): AutoLock/MaximumPasscodeAge/MinimumNumberOfComplexCharacters no
+// longer fall back to the prior state when UEM's response omits them.
+// Renamed from TestProfileResourceRead_PasscodeFieldsPreservedFromPriorState,
+// which asserted the removed fallback behavior.
+func TestProfileResourceRead_PasscodeFieldsOmittedByAPIAreNull(t *testing.T) {
 	t.Parallel()
 
 	// API returns a Passcode block but omits the three fields the UEM API
@@ -1160,16 +1369,16 @@ func TestProfileResourceRead_PasscodeFieldsPreservedFromPriorState(t *testing.T)
 		t.Errorf("MaxFailedAttempts: got %q, want \"5\"", model.Passcode.MaxFailedAttempts.ValueString())
 	}
 
-	// Fields omitted by the API must be preserved from prior state — these are
-	// the three fields documented as not returned by the UEM GET endpoint.
-	if model.Passcode.AutoLock.ValueString() != "5" {
-		t.Errorf("AutoLock: got %q, want %q (should be preserved from prior state)", model.Passcode.AutoLock.ValueString(), "5")
+	// Fields omitted by the API (the three fields documented as not returned
+	// by the UEM GET endpoint) are now null, not preserved from prior state.
+	if !model.Passcode.AutoLock.IsNull() {
+		t.Errorf("AutoLock: got %q, want null (no prior-state fallback)", model.Passcode.AutoLock.ValueString())
 	}
-	if model.Passcode.MaximumPasscodeAge.ValueString() != "90" {
-		t.Errorf("MaximumPasscodeAge: got %q, want %q (should be preserved from prior state)", model.Passcode.MaximumPasscodeAge.ValueString(), "90")
+	if !model.Passcode.MaximumPasscodeAge.IsNull() {
+		t.Errorf("MaximumPasscodeAge: got %q, want null (no prior-state fallback)", model.Passcode.MaximumPasscodeAge.ValueString())
 	}
-	if model.Passcode.MinimumNumberOfComplexCharacters.ValueString() != "2" {
-		t.Errorf("MinimumNumberOfComplexCharacters: got %q, want %q (should be preserved from prior state)", model.Passcode.MinimumNumberOfComplexCharacters.ValueString(), "2")
+	if !model.Passcode.MinimumNumberOfComplexCharacters.IsNull() {
+		t.Errorf("MinimumNumberOfComplexCharacters: got %q, want null (no prior-state fallback)", model.Passcode.MinimumNumberOfComplexCharacters.ValueString())
 	}
 }
 
@@ -1357,7 +1566,7 @@ func TestProfileResourceRead_APIError(t *testing.T) {
 
 	handler := func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusInternalServerError)
+		w.WriteHeader(http.StatusBadRequest)
 		_ = json.NewEncoder(w).Encode(map[string]string{"message": "server error"})
 	}
 
@@ -1484,7 +1693,7 @@ func TestProfileResourceUpdate(t *testing.T) {
 		"platform":             stringVal("Android"),
 		"org_group_id":         stringVal("14165"),
 		"assignment_type":      stringVal("Optional"),
-		"profile_scope":        stringVal("Test"),
+		"profile_scope":        stringVal("Staging"),
 		"is_active":            boolVal(false),
 		"lock_screen_message":  nullString(),
 		"passcode":             nullPasscode(),
@@ -1521,12 +1730,15 @@ func TestProfileResourceUpdate(t *testing.T) {
 }
 
 func TestProfileResourceUpdate_PreservesExistingPayloads(t *testing.T) {
-	// Phase 6: with all platforms migrated to the typed Layer 2
-	// ProfileService, the Update payload is built strictly from modelled
-	// fields. Unknown payloads returned by Get (e.g. AndroidLauncher) are
-	// NOT echoed back — the generated entities don't have them. The only
-	// invariant we still verify is that AndroidForWorkCustomMessages is
-	// omitted when lock_screen_message is null.
+	// zf1 part 1: Update is now a read-modify-write against UEM's
+	// full-replace Update endpoint. The live entity is fetched, and only
+	// the sections this provider models are overlaid from the plan-built
+	// entity; unmodeled sections returned by Get (e.g.
+	// AndroidForWorkApplicationControl, which this provider's schema does
+	// not expose) MUST be echoed back unchanged in the Update payload, or
+	// UEM would silently wipe them server-side. We still also verify the
+	// modeled-but-null invariant: AndroidForWorkCustomMessages is omitted
+	// from the sent entity when lock_screen_message is null in the plan.
 	t.Parallel()
 
 	var capturedBody map[string]interface{}
@@ -1544,6 +1756,10 @@ func TestProfileResourceUpdate_PreservesExistingPayloads(t *testing.T) {
 					"Name":           "Updated Profile",
 					"ProfileUuid":    "updated-uuid",
 					"ProfileContext": "Device",
+				},
+				// Unmodeled Android section — must survive Update unchanged.
+				"AndroidForWorkApplicationControl": map[string]interface{}{
+					"DisableAccessToBlacklistedApps": true,
 				},
 			}
 			_ = json.NewEncoder(w).Encode(resp)
@@ -1565,7 +1781,7 @@ func TestProfileResourceUpdate_PreservesExistingPayloads(t *testing.T) {
 		"platform":             stringVal("Android"),
 		"org_group_id":         stringVal("14165"),
 		"assignment_type":      stringVal("Optional"),
-		"profile_scope":        stringVal("Test"),
+		"profile_scope":        stringVal("Staging"),
 		"is_active":            boolVal(false),
 		"lock_screen_message":  nullString(),
 		"passcode":             nullPasscode(),
@@ -1597,6 +1813,17 @@ func TestProfileResourceUpdate_PreservesExistingPayloads(t *testing.T) {
 	}
 	if _, ok := capturedBody["AndroidForWorkCustomMessages"]; ok {
 		t.Fatal("did not expect AndroidForWorkCustomMessages when lock_screen_message is null")
+	}
+	unmodeled, ok := capturedBody["AndroidForWorkApplicationControl"]
+	if !ok {
+		t.Fatal("expected unmodeled AndroidForWorkApplicationControl section to be preserved from the live entity")
+	}
+	unmodeledMap, ok := unmodeled.(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected AndroidForWorkApplicationControl to be a map, got %T", unmodeled)
+	}
+	if v, ok := unmodeledMap["DisableAccessToBlacklistedApps"].(bool); !ok || !v {
+		t.Fatalf("expected AndroidForWorkApplicationControl.DisableAccessToBlacklistedApps to survive unchanged, got %v", unmodeledMap["DisableAccessToBlacklistedApps"])
 	}
 }
 
@@ -2116,7 +2343,7 @@ func TestProfileResourceCreate_WithNetworkList(t *testing.T) {
 				},
 				"NetworkList": []interface{}{
 					map[string]interface{}{
-						"NetworkInterface":     "Wi-Fi",
+						"NetworkInterface":     "BuiltInWireless",
 						"ServiceSetIdentifier": "Corp-WiFi",
 						"HiddenNetwork":        false,
 						"AutoJoin":             true,
@@ -2152,7 +2379,7 @@ func TestProfileResourceCreate_WithNetworkList(t *testing.T) {
 		"custom_settings_list": nullCustomSettingsList(),
 		"network_list": networkListVal([]map[string]tftypes.Value{
 			{
-				"network_interface":      stringVal("Wi-Fi"),
+				"network_interface":      stringVal("BuiltInWireless"),
 				"service_set_identifier": stringVal("Corp-WiFi"),
 				"hidden_network":         boolVal(false),
 				"auto_join":              boolVal(true),
@@ -2232,7 +2459,7 @@ func TestProfileResourceRead_WithNetworkList(t *testing.T) {
 			},
 			"NetworkList": []interface{}{
 				map[string]interface{}{
-					"NetworkInterface":     "Wi-Fi",
+					"NetworkInterface":     "BuiltInWireless",
 					"ServiceSetIdentifier": "Office-WiFi",
 					"HiddenNetwork":        true,
 					"AutoJoin":             true,
@@ -2353,7 +2580,7 @@ func TestProfileResourceUpdate_WithNetworkList(t *testing.T) {
 		"custom_settings_list": nullCustomSettingsList(),
 		"network_list": networkListVal([]map[string]tftypes.Value{
 			{
-				"network_interface":      stringVal("Wi-Fi"),
+				"network_interface":      stringVal("BuiltInWireless"),
 				"service_set_identifier": stringVal("Updated-WiFi"),
 				"auto_join":              boolVal(false),
 				"security_type":          stringVal("WPA3"),
@@ -2411,7 +2638,7 @@ func TestProfileResourceUpdate_APIError(t *testing.T) {
 
 	handler := func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusInternalServerError)
+		w.WriteHeader(http.StatusBadRequest)
 		_ = json.NewEncoder(w).Encode(map[string]string{"message": "server error"})
 	}
 
@@ -2564,7 +2791,7 @@ func TestProfileResourceDelete_APIError(t *testing.T) {
 		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/profiles/search"):
 			_, _ = w.Write([]byte(`{"ProfileList":[]}`))
 		default:
-			w.WriteHeader(http.StatusInternalServerError)
+			w.WriteHeader(http.StatusBadRequest)
 			_ = json.NewEncoder(w).Encode(map[string]string{"message": "server error"})
 		}
 	}
@@ -2731,14 +2958,14 @@ func TestProfileResourceCreate_WithDiskEncryption(t *testing.T) {
 						"UseIntelligentHub":                     true,
 						"NotifyUserForEncryption":               true,
 						"EncryptionMaxNotifyAttempts":           float64(3),
-						"EncryptionActionAfterLastNotification": "1",
+						"EncryptionActionAfterLastNotification": "ForceLogout",
 					},
 					"DiskEncryptionFileVault2": map[string]interface{}{
 						"Enable":                     true,
 						"ShowRecoveryKey":            true,
 						"RecoveryType":               float64(1),
-						"FileVaultUser":              "1",
-						"PromptToEnableFileVaultAt":  "1",
+						"FileVaultUser":              "CurrentOrNextLoginUser",
+						"PromptToEnableFileVaultAt":  "BothLoginAndLogout",
 						"NumberOfTimesUserCanBypass": float64(3),
 					},
 					"DiskEncryptionMCX": map[string]interface{}{
@@ -2838,8 +3065,8 @@ func TestProfileResourceCreate_WithDiskEncryption(t *testing.T) {
 	if aw["EncryptionMaxNotifyAttempts"] != float64(3) {
 		t.Errorf("expected EncryptionMaxNotifyAttempts 3, got %v", aw["EncryptionMaxNotifyAttempts"])
 	}
-	if aw["EncryptionActionAfterLastNotification"] != "1" {
-		t.Errorf("expected EncryptionActionAfterLastNotification \"1\", got %v", aw["EncryptionActionAfterLastNotification"])
+	if aw["EncryptionActionAfterLastNotification"] != "ForceLogout" {
+		t.Errorf("expected EncryptionActionAfterLastNotification \"ForceLogout\", got %v", aw["EncryptionActionAfterLastNotification"])
 	}
 
 	fv, ok := deTop["DiskEncryptionFileVault2"].(map[string]interface{})
@@ -2855,11 +3082,11 @@ func TestProfileResourceCreate_WithDiskEncryption(t *testing.T) {
 	if fv["RecoveryType"] != float64(1) {
 		t.Errorf("expected RecoveryType 1, got %v", fv["RecoveryType"])
 	}
-	if fv["FileVaultUser"] != "1" {
-		t.Errorf("expected FileVaultUser \"1\", got %v", fv["FileVaultUser"])
+	if fv["FileVaultUser"] != "CurrentOrNextLoginUser" {
+		t.Errorf("expected FileVaultUser \"CurrentOrNextLoginUser\", got %v", fv["FileVaultUser"])
 	}
-	if fv["PromptToEnableFileVaultAt"] != "1" {
-		t.Errorf("expected PromptToEnableFileVaultAt \"1\", got %v", fv["PromptToEnableFileVaultAt"])
+	if fv["PromptToEnableFileVaultAt"] != "BothLoginAndLogout" {
+		t.Errorf("expected PromptToEnableFileVaultAt \"BothLoginAndLogout\", got %v", fv["PromptToEnableFileVaultAt"])
 	}
 	if fv["NumberOfTimesUserCanBypass"] != float64(3) {
 		t.Errorf("expected NumberOfTimesUserCanBypass 3, got %v", fv["NumberOfTimesUserCanBypass"])
@@ -2900,11 +3127,11 @@ func TestProfileResourceCreate_WithDiskEncryption(t *testing.T) {
 	if model.DiskEncryption.FileVault.NumberOfTimesUserCanBypass.ValueInt64() != 3 {
 		t.Errorf("expected NumberOfTimesUserCanBypass 3, got %d", model.DiskEncryption.FileVault.NumberOfTimesUserCanBypass.ValueInt64())
 	}
-	if model.DiskEncryption.MCX == nil {
+	if model.DiskEncryption.MCX.IsNull() {
 		t.Fatal("expected MCX in state")
 	}
-	if model.DiskEncryption.MCX.DestroyFVKeyOnStandby.ValueBool() != true {
-		t.Errorf("expected DestroyFVKeyOnStandby true, got %v", model.DiskEncryption.MCX.DestroyFVKeyOnStandby.ValueBool())
+	if got := mcxDestroyFVKeyOnStandby(t, model.DiskEncryption.MCX); got.ValueBool() != true {
+		t.Errorf("expected DestroyFVKeyOnStandby true, got %v", got.ValueBool())
 	}
 }
 
@@ -2932,14 +3159,14 @@ func TestProfileResourceRead_WithDiskEncryption(t *testing.T) {
 					"UseIntelligentHub":                     true,
 					"NotifyUserForEncryption":               true,
 					"EncryptionMaxNotifyAttempts":           float64(3),
-					"EncryptionActionAfterLastNotification": "1",
+					"EncryptionActionAfterLastNotification": "ForceLogout",
 				},
 				"DiskEncryptionFileVault2": map[string]interface{}{
 					"Enable":                     true,
 					"ShowRecoveryKey":            true,
 					"RecoveryType":               float64(1),
-					"FileVaultUser":              "1",
-					"PromptToEnableFileVaultAt":  "1",
+					"FileVaultUser":              "CurrentOrNextLoginUser",
+					"PromptToEnableFileVaultAt":  "BothLoginAndLogout",
 					"NumberOfTimesUserCanBypass": float64(3),
 				},
 				"DiskEncryptionMCX": map[string]interface{}{
@@ -3041,11 +3268,11 @@ func TestProfileResourceRead_WithDiskEncryption(t *testing.T) {
 	if model.DiskEncryption.FileVault.NumberOfTimesUserCanBypass.ValueInt64() != 3 {
 		t.Errorf("NumberOfTimesUserCanBypass: got %d", model.DiskEncryption.FileVault.NumberOfTimesUserCanBypass.ValueInt64())
 	}
-	if model.DiskEncryption.MCX == nil {
+	if model.DiskEncryption.MCX.IsNull() {
 		t.Fatal("expected MCX")
 	}
-	if model.DiskEncryption.MCX.DestroyFVKeyOnStandby.ValueBool() != true {
-		t.Errorf("DestroyFVKeyOnStandby: got %v", model.DiskEncryption.MCX.DestroyFVKeyOnStandby.ValueBool())
+	if got := mcxDestroyFVKeyOnStandby(t, model.DiskEncryption.MCX); got.ValueBool() != true {
+		t.Errorf("DestroyFVKeyOnStandby: got %v", got.ValueBool())
 	}
 }
 
@@ -3075,14 +3302,14 @@ func TestProfileResourceUpdate_WithDiskEncryption(t *testing.T) {
 						"UseIntelligentHub":                     true,
 						"NotifyUserForEncryption":               true,
 						"EncryptionMaxNotifyAttempts":           float64(3),
-						"EncryptionActionAfterLastNotification": "1",
+						"EncryptionActionAfterLastNotification": "ForceLogout",
 					},
 					"DiskEncryptionFileVault2": map[string]interface{}{
 						"Enable":                     true,
 						"ShowRecoveryKey":            true,
 						"RecoveryType":               float64(1),
-						"FileVaultUser":              "1",
-						"PromptToEnableFileVaultAt":  "1",
+						"FileVaultUser":              "CurrentOrNextLoginUser",
+						"PromptToEnableFileVaultAt":  "BothLoginAndLogout",
 						"NumberOfTimesUserCanBypass": float64(3),
 					},
 					"DiskEncryptionMCX": map[string]interface{}{
@@ -3216,8 +3443,374 @@ func TestProfileResourceUpdate_WithDiskEncryption(t *testing.T) {
 	if model.DiskEncryption.FileVault == nil || model.DiskEncryption.FileVault.RecoveryType.ValueInt64() != 1 {
 		t.Errorf("expected FileVault.RecoveryType 1 in state")
 	}
-	if model.DiskEncryption.MCX == nil || !model.DiskEncryption.MCX.DestroyFVKeyOnStandby.ValueBool() {
+	if model.DiskEncryption.MCX.IsNull() || !mcxDestroyFVKeyOnStandby(t, model.DiskEncryption.MCX).ValueBool() {
 		t.Errorf("expected MCX.DestroyFVKeyOnStandby true in state")
+	}
+}
+
+func TestProfileResourceCreate_WithGatekeeper(t *testing.T) {
+	t.Parallel()
+
+	var capturedBody map[string]interface{}
+
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == "POST" && strings.Contains(r.URL.Path, "/create"):
+			_ = json.NewDecoder(r.Body).Decode(&capturedBody)
+			_ = json.NewEncoder(w).Encode(55555)
+		case r.Method == "GET":
+			resp := map[string]interface{}{
+				"General": map[string]interface{}{
+					"ProfileId":              55555,
+					"Name":                   "macOS Gatekeeper",
+					"ProfileUuid":            "uuid-macos-gatekeeper",
+					"ProfileContext":         "Device",
+					"ManagedLocationGroupID": 14165,
+				},
+				"GateKeeper": map[string]interface{}{
+					"AllowAutoUnlock":              false,
+					"AllowFingerprintForUnlock":    true,
+					"AllowHandoff":                 false,
+					"AllowScreenCapture":           true,
+					"EnableAppSoftwareUpdateDelay": true,
+					"EnableSoftwareUpdateDelay":    true,
+					"EnforcedSoftwareUpdateDelay":  float64(60),
+				},
+			}
+			_ = json.NewEncoder(w).Encode(resp)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}
+
+	c, server := createTestClient(t, handler)
+	defer server.Close()
+
+	res := &ProfileResource{client: c}
+	ctx := context.Background()
+
+	plan := createResourcePlan(t, map[string]tftypes.Value{
+		"id":                   nullString(),
+		"name":                 stringVal("macOS Gatekeeper"),
+		"description":          stringVal("Gatekeeper policy"),
+		"platform":             stringVal("AppleOsX"),
+		"org_group_id":         stringVal("14165"),
+		"assignment_type":      nullString(),
+		"profile_scope":        nullString(),
+		"is_active":            nullBool(),
+		"lock_screen_message":  nullString(),
+		"passcode":             nullPasscode(),
+		"custom_settings_list": nullCustomSettingsList(),
+		"network_list":         nullNetworkList(),
+		"credentials_list":     nullCredentialsList(),
+		"disk_encryption":      nullDiskEncryption(),
+		"gatekeeper": gatekeeperVal(map[string]tftypes.Value{
+			"allow_auto_unlock":                boolVal(false),
+			"allow_fingerprint_for_unlock":     boolVal(true),
+			"allow_handoff":                    boolVal(false),
+			"allow_screen_capture":             boolVal(true),
+			"enable_app_software_update_delay": boolVal(true),
+			"enable_software_update_delay":     boolVal(true),
+			"enforced_software_update_delay":   int64Val(60),
+		}),
+		"restrictions":    nullRestrictions(),
+		"uuid":            nullString(),
+		"profile_context": nullString(),
+	})
+
+	req := resource.CreateRequest{Plan: plan}
+	resp := &resource.CreateResponse{State: emptyResourceState(t)}
+
+	res.Create(ctx, req, resp)
+
+	if resp.Diagnostics.HasError() {
+		var msgs []string
+		for _, d := range resp.Diagnostics.Errors() {
+			msgs = append(msgs, d.Summary()+": "+d.Detail())
+		}
+		t.Fatalf("unexpected errors: %v", msgs)
+	}
+
+	if capturedBody == nil {
+		t.Fatal("expected request body to be captured")
+	}
+	gk, ok := capturedBody["GateKeeper"].(map[string]interface{})
+	if !ok {
+		t.Fatal("expected GateKeeper in request body")
+	}
+	if gk["AllowAutoUnlock"] != false {
+		t.Errorf("expected AllowAutoUnlock false, got %v", gk["AllowAutoUnlock"])
+	}
+	if gk["AllowFingerprintForUnlock"] != true {
+		t.Errorf("expected AllowFingerprintForUnlock true, got %v", gk["AllowFingerprintForUnlock"])
+	}
+	if gk["AllowHandoff"] != false {
+		t.Errorf("expected AllowHandoff false, got %v", gk["AllowHandoff"])
+	}
+	if gk["AllowScreenCapture"] != true {
+		t.Errorf("expected AllowScreenCapture true, got %v", gk["AllowScreenCapture"])
+	}
+	if gk["EnableAppSoftwareUpdateDelay"] != true {
+		t.Errorf("expected EnableAppSoftwareUpdateDelay true, got %v", gk["EnableAppSoftwareUpdateDelay"])
+	}
+	if gk["EnableSoftwareUpdateDelay"] != true {
+		t.Errorf("expected EnableSoftwareUpdateDelay true, got %v", gk["EnableSoftwareUpdateDelay"])
+	}
+	if gk["EnforcedSoftwareUpdateDelay"] != float64(60) {
+		t.Errorf("expected EnforcedSoftwareUpdateDelay 60, got %v", gk["EnforcedSoftwareUpdateDelay"])
+	}
+
+	var model profilemodels.ProfileResourceModel
+	resp.State.Get(ctx, &model)
+
+	if model.ID.ValueString() != "55555" {
+		t.Errorf("expected ID '55555', got '%s'", model.ID.ValueString())
+	}
+	if model.Gatekeeper == nil {
+		t.Fatal("expected Gatekeeper to be set in state after read-back")
+	}
+	if model.Gatekeeper.AllowAutoUnlock.ValueBool() != false {
+		t.Errorf("expected AllowAutoUnlock false, got %v", model.Gatekeeper.AllowAutoUnlock.ValueBool())
+	}
+	if model.Gatekeeper.AllowFingerprintForUnlock.ValueBool() != true {
+		t.Errorf("expected AllowFingerprintForUnlock true, got %v", model.Gatekeeper.AllowFingerprintForUnlock.ValueBool())
+	}
+	if model.Gatekeeper.AllowHandoff.ValueBool() != false {
+		t.Errorf("expected AllowHandoff false, got %v", model.Gatekeeper.AllowHandoff.ValueBool())
+	}
+	if model.Gatekeeper.AllowScreenCapture.ValueBool() != true {
+		t.Errorf("expected AllowScreenCapture true, got %v", model.Gatekeeper.AllowScreenCapture.ValueBool())
+	}
+	if model.Gatekeeper.EnableAppSoftwareUpdateDelay.ValueBool() != true {
+		t.Errorf("expected EnableAppSoftwareUpdateDelay true, got %v", model.Gatekeeper.EnableAppSoftwareUpdateDelay.ValueBool())
+	}
+	if model.Gatekeeper.EnableSoftwareUpdateDelay.ValueBool() != true {
+		t.Errorf("expected EnableSoftwareUpdateDelay true, got %v", model.Gatekeeper.EnableSoftwareUpdateDelay.ValueBool())
+	}
+	if model.Gatekeeper.EnforcedSoftwareUpdateDelay.ValueInt64() != 60 {
+		t.Errorf("expected EnforcedSoftwareUpdateDelay 60, got %d", model.Gatekeeper.EnforcedSoftwareUpdateDelay.ValueInt64())
+	}
+}
+
+func TestProfileResourceRead_WithGatekeeper(t *testing.T) {
+	t.Parallel()
+
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		resp := map[string]interface{}{
+			"General": map[string]interface{}{
+				"ProfileId":              55555,
+				"Name":                   "macOS Gatekeeper",
+				"Description":            "Policy",
+				"AssignmentType":         "Auto",
+				"ProfileScope":           "Production",
+				"ManagedLocationGroupID": 14165,
+				"IsActive":               true,
+				"ProfileUuid":            "uuid-gatekeeper-read",
+				"ProfileContext":         "Device",
+			},
+			"GateKeeper": map[string]interface{}{
+				"AllowAutoUnlock":              false,
+				"AllowFingerprintForUnlock":    true,
+				"AllowHandoff":                 false,
+				"AllowScreenCapture":           true,
+				"EnableAppSoftwareUpdateDelay": true,
+				"EnableSoftwareUpdateDelay":    true,
+				"EnforcedSoftwareUpdateDelay":  float64(60),
+			},
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	}
+
+	c, server := createTestClient(t, handler)
+	defer server.Close()
+
+	res := newProfileResourceWithRegistry(t, c, discoveryEntry(55555, sdk.PlatformAppleOsX))
+	ctx := context.Background()
+
+	state := createResourceState(t, map[string]tftypes.Value{
+		"id":                   stringVal("55555"),
+		"name":                 stringVal("Old Name"),
+		"description":          stringVal("Old"),
+		"platform":             stringVal("AppleOsX"),
+		"org_group_id":         stringVal("14165"),
+		"assignment_type":      stringVal("Auto"),
+		"profile_scope":        stringVal("Production"),
+		"is_active":            boolVal(true),
+		"lock_screen_message":  nullString(),
+		"passcode":             nullPasscode(),
+		"custom_settings_list": nullCustomSettingsList(),
+		"network_list":         nullNetworkList(),
+		"credentials_list":     nullCredentialsList(),
+		"disk_encryption":      nullDiskEncryption(),
+		"gatekeeper":           nullGatekeeper(),
+		"restrictions":         nullRestrictions(),
+		"uuid":                 stringVal("old-uuid"),
+		"profile_context":      stringVal("Device"),
+	})
+
+	req := resource.ReadRequest{State: state}
+	resp := &resource.ReadResponse{State: state}
+
+	res.Read(ctx, req, resp)
+
+	if resp.Diagnostics.HasError() {
+		var msgs []string
+		for _, d := range resp.Diagnostics.Errors() {
+			msgs = append(msgs, d.Summary()+": "+d.Detail())
+		}
+		t.Fatalf("unexpected errors: %v", msgs)
+	}
+
+	var model profilemodels.ProfileResourceModel
+	resp.State.Get(ctx, &model)
+
+	if model.Name.ValueString() != "macOS Gatekeeper" {
+		t.Errorf("expected Name 'macOS Gatekeeper', got '%s'", model.Name.ValueString())
+	}
+	if model.Gatekeeper == nil {
+		t.Fatal("expected Gatekeeper to be populated from API response")
+	}
+	if model.Gatekeeper.AllowAutoUnlock.ValueBool() != false {
+		t.Errorf("AllowAutoUnlock: got %v", model.Gatekeeper.AllowAutoUnlock.ValueBool())
+	}
+	if model.Gatekeeper.AllowFingerprintForUnlock.ValueBool() != true {
+		t.Errorf("AllowFingerprintForUnlock: got %v", model.Gatekeeper.AllowFingerprintForUnlock.ValueBool())
+	}
+	if model.Gatekeeper.AllowHandoff.ValueBool() != false {
+		t.Errorf("AllowHandoff: got %v", model.Gatekeeper.AllowHandoff.ValueBool())
+	}
+	if model.Gatekeeper.AllowScreenCapture.ValueBool() != true {
+		t.Errorf("AllowScreenCapture: got %v", model.Gatekeeper.AllowScreenCapture.ValueBool())
+	}
+	if model.Gatekeeper.EnableAppSoftwareUpdateDelay.ValueBool() != true {
+		t.Errorf("EnableAppSoftwareUpdateDelay: got %v", model.Gatekeeper.EnableAppSoftwareUpdateDelay.ValueBool())
+	}
+	if model.Gatekeeper.EnableSoftwareUpdateDelay.ValueBool() != true {
+		t.Errorf("EnableSoftwareUpdateDelay: got %v", model.Gatekeeper.EnableSoftwareUpdateDelay.ValueBool())
+	}
+	if model.Gatekeeper.EnforcedSoftwareUpdateDelay.ValueInt64() != 60 {
+		t.Errorf("EnforcedSoftwareUpdateDelay: got %d, want 60", model.Gatekeeper.EnforcedSoftwareUpdateDelay.ValueInt64())
+	}
+}
+
+func TestProfileResourceUpdate_WithGatekeeper(t *testing.T) {
+	t.Parallel()
+
+	var capturedBody map[string]interface{}
+
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == "POST" && strings.Contains(r.URL.Path, "/update"):
+			_ = json.NewDecoder(r.Body).Decode(&capturedBody)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{})
+		case r.Method == "GET":
+			resp := map[string]interface{}{
+				"General": map[string]interface{}{
+					"ProfileId":      66666,
+					"Name":           "Updated Gatekeeper",
+					"ProfileUuid":    "uuid-updated-gatekeeper",
+					"ProfileContext": "Device",
+				},
+				"GateKeeper": map[string]interface{}{
+					"AllowAutoUnlock":              false,
+					"AllowFingerprintForUnlock":    true,
+					"AllowHandoff":                 false,
+					"AllowScreenCapture":           true,
+					"EnableAppSoftwareUpdateDelay": true,
+					"EnableSoftwareUpdateDelay":    true,
+					"EnforcedSoftwareUpdateDelay":  float64(60),
+				},
+			}
+			_ = json.NewEncoder(w).Encode(resp)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}
+
+	c, server := createTestClient(t, handler)
+	defer server.Close()
+
+	res := &ProfileResource{client: c}
+	ctx := context.Background()
+
+	plan := createResourcePlan(t, map[string]tftypes.Value{
+		"id":                   stringVal("66666"),
+		"name":                 stringVal("Updated Gatekeeper"),
+		"description":          stringVal("Updated policy"),
+		"platform":             stringVal("AppleOsX"),
+		"org_group_id":         stringVal("14165"),
+		"assignment_type":      stringVal("Auto"),
+		"profile_scope":        stringVal("Production"),
+		"is_active":            boolVal(true),
+		"lock_screen_message":  nullString(),
+		"passcode":             nullPasscode(),
+		"custom_settings_list": nullCustomSettingsList(),
+		"network_list":         nullNetworkList(),
+		"credentials_list":     nullCredentialsList(),
+		"disk_encryption":      nullDiskEncryption(),
+		"gatekeeper": gatekeeperVal(map[string]tftypes.Value{
+			"allow_auto_unlock":                boolVal(false),
+			"allow_fingerprint_for_unlock":     boolVal(true),
+			"allow_handoff":                    boolVal(false),
+			"allow_screen_capture":             boolVal(true),
+			"enable_app_software_update_delay": boolVal(true),
+			"enable_software_update_delay":     boolVal(true),
+			"enforced_software_update_delay":   int64Val(60),
+		}),
+		"restrictions":    nullRestrictions(),
+		"uuid":            stringVal("old-uuid"),
+		"profile_context": stringVal("Device"),
+	})
+
+	req := resource.UpdateRequest{Plan: plan, State: emptyResourceState(t)}
+	resp := &resource.UpdateResponse{State: emptyResourceState(t)}
+
+	res.Update(ctx, req, resp)
+
+	if resp.Diagnostics.HasError() {
+		var msgs []string
+		for _, d := range resp.Diagnostics.Errors() {
+			msgs = append(msgs, d.Summary()+": "+d.Detail())
+		}
+		t.Fatalf("unexpected errors: %v", msgs)
+	}
+
+	if capturedBody == nil {
+		t.Fatal("expected request body to be captured")
+	}
+	gk, ok := capturedBody["GateKeeper"].(map[string]interface{})
+	if !ok {
+		t.Fatal("expected GateKeeper in update request body")
+	}
+	if gk["AllowScreenCapture"] != true {
+		t.Errorf("expected AllowScreenCapture true, got %v", gk["AllowScreenCapture"])
+	}
+	if gk["EnforcedSoftwareUpdateDelay"] != float64(60) {
+		t.Errorf("expected EnforcedSoftwareUpdateDelay 60, got %v", gk["EnforcedSoftwareUpdateDelay"])
+	}
+
+	general, ok := capturedBody["General"].(map[string]interface{})
+	if !ok {
+		t.Fatal("expected General in update request")
+	}
+	if general["ProfileId"] != float64(66666) {
+		t.Errorf("expected ProfileId 66666, got %v", general["ProfileId"])
+	}
+
+	var model profilemodels.ProfileResourceModel
+	resp.State.Get(ctx, &model)
+
+	if model.Gatekeeper == nil {
+		t.Fatal("expected Gatekeeper in state after read-back")
+	}
+	if model.Gatekeeper.AllowScreenCapture.ValueBool() != true {
+		t.Errorf("expected Gatekeeper.AllowScreenCapture true in state")
+	}
+	if model.Gatekeeper.EnforcedSoftwareUpdateDelay.ValueInt64() != 60 {
+		t.Errorf("expected Gatekeeper.EnforcedSoftwareUpdateDelay 60 in state")
 	}
 }
 
@@ -3225,56 +3818,9 @@ func TestProfileResourceUpdate_WithDiskEncryption(t *testing.T) {
 // Unit tests for credential helper functions
 // ---------------------------------------------------------------------------
 
-func TestAnyNetworkReferencesCredential(t *testing.T) {
-	t.Parallel()
-
-	creds := []profilemodels.CredentialItemModel{
-		{CredentialName: types.StringValue("cert-a")},
-		{CredentialName: types.StringValue("cert-b")},
-	}
-
-	tests := []struct {
-		name     string
-		networks []profilemodels.NetworkItemModel
-		want     bool
-	}{
-		{
-			name:     "no networks",
-			networks: nil,
-			want:     false,
-		},
-		{
-			name: "network without identity_certificate",
-			networks: []profilemodels.NetworkItemModel{
-				{ServiceSetIdentifier: types.StringValue("Corp-WiFi")},
-			},
-			want: false,
-		},
-		{
-			name: "network references existing credential",
-			networks: []profilemodels.NetworkItemModel{
-				{IdentityCertificate: types.StringValue("cert-b")},
-			},
-			want: true,
-		},
-		{
-			name: "network references non-existent credential",
-			networks: []profilemodels.NetworkItemModel{
-				{IdentityCertificate: types.StringValue("cert-z")},
-			},
-			want: false,
-		},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			got := profilestate.AnyNetworkReferencesCredential(tc.networks, creds)
-			if got != tc.want {
-				t.Errorf("profilestate.AnyNetworkReferencesCredential() = %v, want %v", got, tc.want)
-			}
-		})
-	}
-}
+// internal-ticket removed AnyNetworkReferencesCredential along with the
+// credentials_list-drop it gated in PrepareCredentialsForPayload (row #97 of
+// the B16 audit); TestAnyNetworkReferencesCredential is removed with it.
 
 func TestUploadCertificatesTyped_ReusesPriorIDForUnchangedPayload(t *testing.T) {
 	t.Parallel()
@@ -3351,64 +3897,12 @@ func TestUploadCertificatesTyped_AllowsExplicitCertificateID(t *testing.T) {
 	}
 }
 
-func TestMergeCredentialsListWithPriorState_ByName(t *testing.T) {
-	t.Parallel()
-
-	stateList := []profilemodels.CredentialItemModel{
-		{
-			CredentialName:      types.StringValue("cert-a"),
-			CredentialSource:    types.StringValue("Upload"),
-			CertificatePayload:  types.StringValue("base64-payload-a"),
-			CertificatePassword: types.StringValue("secret-a"),
-		},
-		{
-			CredentialName:      types.StringValue("cert-b"),
-			CredentialSource:    types.StringValue("Upload"),
-			CertificatePayload:  types.StringValue("base64-payload-b"),
-			CertificatePassword: types.StringValue("secret-b"),
-		},
-	}
-
-	// API returns items in reversed order; write-only fields are absent.
-	apiList := []profilemodels.CredentialItemModel{
-		{CredentialName: types.StringValue("cert-b"), CertificateID: types.Int64Value(200)},
-		{CredentialName: types.StringValue("cert-a"), CertificateID: types.Int64Value(100)},
-	}
-
-	result := profilestate.MergeCredentialsListWithPriorState(apiList, stateList)
-
-	if len(result) != 2 {
-		t.Fatalf("expected 2 items, got %d", len(result))
-	}
-
-	// cert-b (index 0 in API) should get cert-b's write-only fields
-	if result[0].CertificatePayload.ValueString() != "base64-payload-b" {
-		t.Errorf("result[0] (cert-b) payload = %q, want %q", result[0].CertificatePayload.ValueString(), "base64-payload-b")
-	}
-	if result[0].CertificatePassword.ValueString() != "secret-b" {
-		t.Errorf("result[0] (cert-b) password = %q, want %q", result[0].CertificatePassword.ValueString(), "secret-b")
-	}
-
-	// cert-a (index 1 in API) should get cert-a's write-only fields
-	if result[1].CertificatePayload.ValueString() != "base64-payload-a" {
-		t.Errorf("result[1] (cert-a) payload = %q, want %q", result[1].CertificatePayload.ValueString(), "base64-payload-a")
-	}
-	if result[1].CertificatePassword.ValueString() != "secret-a" {
-		t.Errorf("result[1] (cert-a) password = %q, want %q", result[1].CertificatePassword.ValueString(), "secret-a")
-	}
-}
-
-func TestMergeCredentialsListWithPriorState_NilAPI(t *testing.T) {
-	t.Parallel()
-
-	stateList := []profilemodels.CredentialItemModel{
-		{CredentialName: types.StringValue("cert-a")},
-	}
-	result := profilestate.MergeCredentialsListWithPriorState(nil, stateList)
-	if result != nil {
-		t.Errorf("expected nil, got %v", result)
-	}
-}
+// internal-ticket removed MergeCredentialsListWithPriorState in full (row #87 of
+// the B16 audit): credentials_list is now exactly what
+// mapAppleOsXCredentialsList returned, with no name/index-keyed pinning of
+// write-only fields, CredentialSource, or CredentialName back onto the API
+// response. TestMergeCredentialsListWithPriorState_ByName/_NilAPI are
+// removed along with it.
 
 func TestCredentialKey(t *testing.T) {
 	t.Parallel()
@@ -3435,15 +3929,34 @@ func TestCredentialKey(t *testing.T) {
 	}
 }
 
-// --- useStateForNullModifier tests ---
+// --- nullWhenConfigNull* top-level modifier tests (internal-task) ---
 
-// TestUseStateForNullModifier_PlanModifyObject covers all three code paths of
-// the PlanModifyObject implementation, including the new unknown→null branch
-// added to fix Create when passcode is omitted from config.
-func TestUseStateForNullModifier_PlanModifyObject(t *testing.T) {
+// TestNullWhenConfigNullObjectModifier_PlanModifyObject covers the three
+// cases for the new top-level Object modifier that replaced
+// objectplanmodifier.UseStateForUnknown()+useStateForNull(): removing a
+// managed block from config must plan it as null (not copy prior state)
+// so the RMW Update actually clears it on apply; unconfigured-on-create
+// must also become null, never unknown; a configured value is untouched.
+func TestNullWhenConfigNullObjectModifier_PlanModifyObject(t *testing.T) {
 	t.Parallel()
 
 	attrTypes := map[string]attr.Type{"field": types.StringType}
+
+	// unknown config (e.g. a block fed by a not-yet-known variable) must stay
+	// unknown: planning null here would make core reject the plan as invalid.
+	t.Run("unknown config leaves plan unknown", func(t *testing.T) {
+		t.Parallel()
+		req := planmodifier.ObjectRequest{
+			ConfigValue: types.ObjectUnknown(attrTypes),
+			StateValue:  types.ObjectNull(attrTypes),
+			PlanValue:   types.ObjectUnknown(attrTypes),
+		}
+		resp := &planmodifier.ObjectResponse{PlanValue: req.PlanValue}
+		nullWhenConfigNullObjectModifier{}.PlanModifyObject(context.Background(), req, resp)
+		if !resp.PlanValue.IsUnknown() {
+			t.Errorf("expected plan to stay unknown for unknown config, got %v", resp.PlanValue)
+		}
+	})
 
 	buildObj := func(t *testing.T, v map[string]attr.Value) types.Object {
 		t.Helper()
@@ -3454,25 +3967,26 @@ func TestUseStateForNullModifier_PlanModifyObject(t *testing.T) {
 		return obj
 	}
 
-	// null config + non-null state → plan is replaced by state (import case).
-	t.Run("null config with prior state copies state to plan", func(t *testing.T) {
+	// null config + non-null state (block removed from HCL) → plan is null,
+	// NOT the prior state value. This is the removal-clears fix itself.
+	t.Run("null config with non-null state plans null (removal)", func(t *testing.T) {
 		t.Parallel()
 		stateVal := buildObj(t, map[string]attr.Value{"field": types.StringValue("from-state")})
 		req := planmodifier.ObjectRequest{
 			ConfigValue: types.ObjectNull(attrTypes),
 			StateValue:  stateVal,
-			PlanValue:   stateVal,
+			PlanValue:   types.ObjectUnknown(attrTypes),
 		}
 		resp := &planmodifier.ObjectResponse{PlanValue: req.PlanValue}
-		useStateForNullModifier{}.PlanModifyObject(context.Background(), req, resp)
-		if !resp.PlanValue.Equal(stateVal) {
-			t.Errorf("expected state value in plan, got %v", resp.PlanValue)
+		nullWhenConfigNullObjectModifier{}.PlanModifyObject(context.Background(), req, resp)
+		if !resp.PlanValue.IsNull() {
+			t.Errorf("expected null plan on removal, got %v", resp.PlanValue)
 		}
 	})
 
-	// null config + null state + unknown plan → plan becomes null (Create without config).
-	// This is the branch added to fix the "cannot handle unknown values" error.
-	t.Run("null config and state with unknown plan becomes null on Create", func(t *testing.T) {
+	// null config + null state (Create without config) → plan is null, never
+	// unknown, avoiding "cannot handle unknown values" on decode.
+	t.Run("null config with null state plans null, never unknown (create)", func(t *testing.T) {
 		t.Parallel()
 		req := planmodifier.ObjectRequest{
 			ConfigValue: types.ObjectNull(attrTypes),
@@ -3480,9 +3994,12 @@ func TestUseStateForNullModifier_PlanModifyObject(t *testing.T) {
 			PlanValue:   types.ObjectUnknown(attrTypes),
 		}
 		resp := &planmodifier.ObjectResponse{PlanValue: req.PlanValue}
-		useStateForNullModifier{}.PlanModifyObject(context.Background(), req, resp)
+		nullWhenConfigNullObjectModifier{}.PlanModifyObject(context.Background(), req, resp)
+		if resp.PlanValue.IsUnknown() {
+			t.Errorf("expected plan to never be unknown on create, got %v", resp.PlanValue)
+		}
 		if !resp.PlanValue.IsNull() {
-			t.Errorf("expected null plan on Create with no config, got %v", resp.PlanValue)
+			t.Errorf("expected null plan on create with no config, got %v", resp.PlanValue)
 		}
 	})
 
@@ -3496,11 +4013,379 @@ func TestUseStateForNullModifier_PlanModifyObject(t *testing.T) {
 			PlanValue:   planVal,
 		}
 		resp := &planmodifier.ObjectResponse{PlanValue: req.PlanValue}
-		useStateForNullModifier{}.PlanModifyObject(context.Background(), req, resp)
+		nullWhenConfigNullObjectModifier{}.PlanModifyObject(context.Background(), req, resp)
 		if !resp.PlanValue.Equal(planVal) {
 			t.Errorf("expected plan unchanged when config is set, got %v", resp.PlanValue)
 		}
 	})
+}
+
+// TestNullWhenConfigNullListModifier_PlanModifyList is the List-typed
+// equivalent of TestNullWhenConfigNullObjectModifier_PlanModifyObject,
+// covering custom_settings_list/network_list/credentials_list.
+func TestNullWhenConfigNullListModifier_PlanModifyList(t *testing.T) {
+	t.Parallel()
+
+	elemType := types.StringType
+
+	// unknown config must stay unknown (see the Object test).
+	t.Run("unknown config leaves plan unknown", func(t *testing.T) {
+		t.Parallel()
+		req := planmodifier.ListRequest{
+			ConfigValue: types.ListUnknown(elemType),
+			StateValue:  types.ListNull(elemType),
+			PlanValue:   types.ListUnknown(elemType),
+		}
+		resp := &planmodifier.ListResponse{PlanValue: req.PlanValue}
+		nullWhenConfigNullListModifier{}.PlanModifyList(context.Background(), req, resp)
+		if !resp.PlanValue.IsUnknown() {
+			t.Errorf("expected plan to stay unknown for unknown config, got %v", resp.PlanValue)
+		}
+	})
+
+	t.Run("null config with non-null state plans null (removal)", func(t *testing.T) {
+		t.Parallel()
+		stateVal, diags := types.ListValue(elemType, []attr.Value{types.StringValue("from-state")})
+		if diags.HasError() {
+			t.Fatalf("building list value: %v", diags)
+		}
+		req := planmodifier.ListRequest{
+			ConfigValue: types.ListNull(elemType),
+			StateValue:  stateVal,
+			PlanValue:   types.ListUnknown(elemType),
+		}
+		resp := &planmodifier.ListResponse{PlanValue: req.PlanValue}
+		nullWhenConfigNullListModifier{}.PlanModifyList(context.Background(), req, resp)
+		if !resp.PlanValue.IsNull() {
+			t.Errorf("expected null plan on removal, got %v", resp.PlanValue)
+		}
+	})
+
+	t.Run("null config with null state plans null, never unknown (create)", func(t *testing.T) {
+		t.Parallel()
+		req := planmodifier.ListRequest{
+			ConfigValue: types.ListNull(elemType),
+			StateValue:  types.ListNull(elemType),
+			PlanValue:   types.ListUnknown(elemType),
+		}
+		resp := &planmodifier.ListResponse{PlanValue: req.PlanValue}
+		nullWhenConfigNullListModifier{}.PlanModifyList(context.Background(), req, resp)
+		if resp.PlanValue.IsUnknown() {
+			t.Errorf("expected plan to never be unknown on create, got %v", resp.PlanValue)
+		}
+		if !resp.PlanValue.IsNull() {
+			t.Errorf("expected null plan on create with no config, got %v", resp.PlanValue)
+		}
+	})
+
+	t.Run("non-null config leaves plan unchanged", func(t *testing.T) {
+		t.Parallel()
+		planVal, diags := types.ListValue(elemType, []attr.Value{types.StringValue("configured")})
+		if diags.HasError() {
+			t.Fatalf("building list value: %v", diags)
+		}
+		req := planmodifier.ListRequest{
+			ConfigValue: planVal,
+			StateValue:  types.ListNull(elemType),
+			PlanValue:   planVal,
+		}
+		resp := &planmodifier.ListResponse{PlanValue: req.PlanValue}
+		nullWhenConfigNullListModifier{}.PlanModifyList(context.Background(), req, resp)
+		if !resp.PlanValue.Equal(planVal) {
+			t.Errorf("expected plan unchanged when config is set, got %v", resp.PlanValue)
+		}
+	})
+}
+
+// TestNullWhenConfigNullStringModifier_PlanModifyString is the String-typed
+// equivalent, covering the top-level description attribute.
+func TestDescriptionPlanModifier_PlanModifyString(t *testing.T) {
+	t.Parallel()
+
+	// unknown config must stay unknown (see the Object test).
+	t.Run("unknown config leaves plan unknown", func(t *testing.T) {
+		t.Parallel()
+		req := planmodifier.StringRequest{
+			ConfigValue: types.StringUnknown(),
+			StateValue:  types.StringNull(),
+			PlanValue:   types.StringUnknown(),
+		}
+		resp := &planmodifier.StringResponse{PlanValue: req.PlanValue}
+		descriptionPlanModifier{}.PlanModifyString(context.Background(), req, resp)
+		if !resp.PlanValue.IsUnknown() {
+			t.Errorf("expected plan to stay unknown for unknown config, got %v", resp.PlanValue)
+		}
+	})
+
+	t.Run("null config with non-empty state plans empty (removal clears)", func(t *testing.T) {
+		t.Parallel()
+		req := planmodifier.StringRequest{
+			ConfigValue: types.StringNull(),
+			StateValue:  types.StringValue("from-state"),
+			PlanValue:   types.StringUnknown(),
+		}
+		resp := &planmodifier.StringResponse{PlanValue: req.PlanValue}
+		descriptionPlanModifier{}.PlanModifyString(context.Background(), req, resp)
+		if resp.PlanValue.IsNull() || resp.PlanValue.IsUnknown() || resp.PlanValue.ValueString() != "" {
+			t.Errorf("expected \"\" plan on removal, got %v", resp.PlanValue)
+		}
+	})
+
+	t.Run("null config with empty state keeps empty (no diff after UEM stored empty)", func(t *testing.T) {
+		t.Parallel()
+		req := planmodifier.StringRequest{
+			ConfigValue: types.StringNull(),
+			StateValue:  types.StringValue(""),
+			PlanValue:   types.StringUnknown(),
+		}
+		resp := &planmodifier.StringResponse{PlanValue: req.PlanValue}
+		descriptionPlanModifier{}.PlanModifyString(context.Background(), req, resp)
+		if resp.PlanValue.IsUnknown() || resp.PlanValue.ValueString() != "" {
+			t.Errorf("expected \"\" plan when state is empty, got %v", resp.PlanValue)
+		}
+	})
+
+	t.Run("null config with null state stays unknown on create", func(t *testing.T) {
+		t.Parallel()
+		req := planmodifier.StringRequest{
+			ConfigValue: types.StringNull(),
+			StateValue:  types.StringNull(),
+			PlanValue:   types.StringUnknown(),
+		}
+		resp := &planmodifier.StringResponse{PlanValue: req.PlanValue}
+		descriptionPlanModifier{}.PlanModifyString(context.Background(), req, resp)
+		if !resp.PlanValue.IsUnknown() {
+			t.Errorf("expected unknown plan on create with no config, so UEM's stored value is accepted; got %v", resp.PlanValue)
+		}
+	})
+
+	t.Run("non-null config leaves plan unchanged", func(t *testing.T) {
+		t.Parallel()
+		req := planmodifier.StringRequest{
+			ConfigValue: types.StringValue("configured"),
+			StateValue:  types.StringNull(),
+			PlanValue:   types.StringValue("configured"),
+		}
+		resp := &planmodifier.StringResponse{PlanValue: req.PlanValue}
+		descriptionPlanModifier{}.PlanModifyString(context.Background(), req, resp)
+		if resp.PlanValue.ValueString() != "configured" {
+			t.Errorf("expected plan unchanged when config is set, got %v", resp.PlanValue)
+		}
+	})
+}
+
+// TestCredentialSourceCanonicalizeModifier_PlanModifyString covers b16
+// decision table row #52 (CORRECT): UEM's API only ever returns/expects
+// "DefinedCA" for a CA-backed credential (canonical Q7), so a plan carrying
+// the legacy "DefinedCertificateAuthority" spelling must be canonicalized to
+// "DefinedCA" to avoid a perpetual diff against UEM's own GET readback on a
+// Required (non-Computed) attribute.
+func TestCredentialSourceCanonicalizeModifier_PlanModifyString(t *testing.T) {
+	t.Parallel()
+
+	t.Run("legacy spelling is canonicalized to DefinedCA", func(t *testing.T) {
+		t.Parallel()
+		req := planmodifier.StringRequest{
+			PlanValue: types.StringValue("DefinedCertificateAuthority"),
+		}
+		resp := &planmodifier.StringResponse{PlanValue: req.PlanValue}
+		credentialSourceCanonicalizeModifier{}.PlanModifyString(context.Background(), req, resp)
+		if resp.PlanValue.ValueString() != "DefinedCA" {
+			t.Errorf(`expected "DefinedCA", got %v`, resp.PlanValue)
+		}
+	})
+
+	t.Run("canonical spelling passes through unchanged", func(t *testing.T) {
+		t.Parallel()
+		req := planmodifier.StringRequest{
+			PlanValue: types.StringValue("DefinedCA"),
+		}
+		resp := &planmodifier.StringResponse{PlanValue: req.PlanValue}
+		credentialSourceCanonicalizeModifier{}.PlanModifyString(context.Background(), req, resp)
+		if resp.PlanValue.ValueString() != "DefinedCA" {
+			t.Errorf(`expected "DefinedCA" unchanged, got %v`, resp.PlanValue)
+		}
+	})
+
+	t.Run("Upload passes through unchanged", func(t *testing.T) {
+		t.Parallel()
+		req := planmodifier.StringRequest{
+			PlanValue: types.StringValue("Upload"),
+		}
+		resp := &planmodifier.StringResponse{PlanValue: req.PlanValue}
+		credentialSourceCanonicalizeModifier{}.PlanModifyString(context.Background(), req, resp)
+		if resp.PlanValue.ValueString() != "Upload" {
+			t.Errorf(`expected "Upload" unchanged, got %v`, resp.PlanValue)
+		}
+	})
+
+	t.Run("unknown plan value is left untouched", func(t *testing.T) {
+		t.Parallel()
+		req := planmodifier.StringRequest{
+			PlanValue: types.StringUnknown(),
+		}
+		resp := &planmodifier.StringResponse{PlanValue: req.PlanValue}
+		credentialSourceCanonicalizeModifier{}.PlanModifyString(context.Background(), req, resp)
+		if !resp.PlanValue.IsUnknown() {
+			t.Errorf("expected plan to stay unknown, got %v", resp.PlanValue)
+		}
+	})
+
+	t.Run("null plan value is left untouched", func(t *testing.T) {
+		t.Parallel()
+		req := planmodifier.StringRequest{
+			PlanValue: types.StringNull(),
+		}
+		resp := &planmodifier.StringResponse{PlanValue: req.PlanValue}
+		credentialSourceCanonicalizeModifier{}.PlanModifyString(context.Background(), req, resp)
+		if !resp.PlanValue.IsNull() {
+			t.Errorf("expected plan to stay null, got %v", resp.PlanValue)
+		}
+	})
+}
+
+// --- useStateForNull{List,String,Bool,Int64} nested-attribute modifier
+// tests (unchanged usage: they still back nested attrs like network_list
+// items and credentials_list items, so their existing "copy state on null
+// config" behavior remains correct there and is exercised here directly). ---
+
+func TestUseStateForNullListModifier_PlanModifyList(t *testing.T) {
+	t.Parallel()
+
+	elemType := types.StringType
+
+	t.Run("null config with prior state copies state to plan", func(t *testing.T) {
+		t.Parallel()
+		stateVal, diags := types.ListValue(elemType, []attr.Value{types.StringValue("from-state")})
+		if diags.HasError() {
+			t.Fatalf("building list value: %v", diags)
+		}
+		req := planmodifier.ListRequest{
+			ConfigValue: types.ListNull(elemType),
+			StateValue:  stateVal,
+			PlanValue:   stateVal,
+		}
+		resp := &planmodifier.ListResponse{PlanValue: req.PlanValue}
+		useStateForNullListModifier{}.PlanModifyList(context.Background(), req, resp)
+		if !resp.PlanValue.Equal(stateVal) {
+			t.Errorf("expected state value in plan, got %v", resp.PlanValue)
+		}
+	})
+
+	t.Run("null config and state with unknown plan becomes null on Create", func(t *testing.T) {
+		t.Parallel()
+		req := planmodifier.ListRequest{
+			ConfigValue: types.ListNull(elemType),
+			StateValue:  types.ListNull(elemType),
+			PlanValue:   types.ListUnknown(elemType),
+		}
+		resp := &planmodifier.ListResponse{PlanValue: req.PlanValue}
+		useStateForNullListModifier{}.PlanModifyList(context.Background(), req, resp)
+		if !resp.PlanValue.IsNull() {
+			t.Errorf("expected null plan on Create with no config, got %v", resp.PlanValue)
+		}
+	})
+}
+
+func TestUseStateForNullStringModifier_PlanModifyString(t *testing.T) {
+	t.Parallel()
+
+	t.Run("null config with prior state copies state to plan", func(t *testing.T) {
+		t.Parallel()
+		req := planmodifier.StringRequest{
+			ConfigValue: types.StringNull(),
+			StateValue:  types.StringValue("from-state"),
+			PlanValue:   types.StringUnknown(),
+		}
+		resp := &planmodifier.StringResponse{PlanValue: req.PlanValue}
+		useStateForNullStringModifier{}.PlanModifyString(context.Background(), req, resp)
+		if resp.PlanValue.ValueString() != "from-state" {
+			t.Errorf("expected state value in plan, got %v", resp.PlanValue)
+		}
+	})
+}
+
+// TestNullWhenConfigNullModifiers_ImportShapedConfigIsANoOp builds state
+// from a realistic fetched macOS entity via the real read mappers
+// (profilestate.ReadProfileIntoState — the same call path Read/Create/
+// Update use), simulating an import. It then builds a generator-style
+// config that mirrors state exactly, attribute-for-attribute (the same
+// value where state is non-null, null where state is null) — what
+// `terraform plan -generate-config-out` produces after import — and
+// verifies each of the 8 nullWhenConfigNull* top-level modifiers leaves the
+// plan completely unchanged: an empty plan at the modifier level, because
+// config == state always lands in the "non-null config, no-op" branch.
+func TestNullWhenConfigNullModifiers_ImportShapedConfigIsANoOp(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	var data profilemodels.ProfileResourceModel
+	profilestate.ReadProfileIntoState(ctx, &data, &sdk.ProfileResult{AppleOsX: liveAppleOsXEntityAllBlocks()})
+
+	var schemaResp resource.SchemaResponse
+	(&ProfileResource{}).Schema(ctx, resource.SchemaRequest{}, &schemaResp)
+	sch := schemaResp.Schema
+
+	checkObject := func(name string, modelValue any) {
+		t.Helper()
+		objType, ok := sch.Attributes[name].GetType().(types.ObjectType)
+		if !ok {
+			t.Fatalf("%s: expected an Object-typed attribute", name)
+		}
+		val, diags := types.ObjectValueFrom(ctx, objType.AttrTypes, modelValue)
+		if diags.HasError() {
+			t.Fatalf("%s: building object value: %v", name, diags)
+		}
+		req := planmodifier.ObjectRequest{ConfigValue: val, StateValue: val, PlanValue: val}
+		resp := &planmodifier.ObjectResponse{PlanValue: req.PlanValue}
+		nullWhenConfigNullObjectModifier{}.PlanModifyObject(ctx, req, resp)
+		if !resp.PlanValue.Equal(val) {
+			t.Errorf("%s: expected plan unchanged for import-shaped config, got %v (want %v)", name, resp.PlanValue, val)
+		}
+	}
+
+	checkList := func(name string, modelValue any) {
+		t.Helper()
+		listType, ok := sch.Attributes[name].GetType().(types.ListType)
+		if !ok {
+			t.Fatalf("%s: expected a List-typed attribute", name)
+		}
+		val, diags := types.ListValueFrom(ctx, listType.ElemType, modelValue)
+		if diags.HasError() {
+			t.Fatalf("%s: building list value: %v", name, diags)
+		}
+		req := planmodifier.ListRequest{ConfigValue: val, StateValue: val, PlanValue: val}
+		resp := &planmodifier.ListResponse{PlanValue: req.PlanValue}
+		nullWhenConfigNullListModifier{}.PlanModifyList(ctx, req, resp)
+		if !resp.PlanValue.Equal(val) {
+			t.Errorf("%s: expected plan unchanged for import-shaped config, got %v (want %v)", name, resp.PlanValue, val)
+		}
+	}
+
+	checkObject("passcode", data.Passcode)
+	checkObject("disk_encryption", data.DiskEncryption)
+	checkObject("gatekeeper", data.Gatekeeper)
+	checkObject("restrictions", data.Restrictions)
+	checkList("custom_settings_list", data.CustomSettingsList)
+	checkList("network_list", data.NetworkList)
+	checkList("credentials_list", data.CredentialsList)
+
+	descReq := planmodifier.StringRequest{ConfigValue: data.Description, StateValue: data.Description, PlanValue: data.Description}
+	descResp := &planmodifier.StringResponse{PlanValue: descReq.PlanValue}
+	descriptionPlanModifier{}.PlanModifyString(ctx, descReq, descResp)
+	if !descResp.PlanValue.Equal(data.Description) {
+		t.Errorf("description: expected plan unchanged for import-shaped config, got %v (want %v)", descResp.PlanValue, data.Description)
+	}
+
+	// Sanity: this test is only meaningful if the fetched entity actually
+	// populated every block; otherwise the assertions above would trivially
+	// pass on already-null values without ever exercising the non-null
+	// "leave it alone" branch this test exists to cover.
+	if data.Passcode == nil || data.DiskEncryption == nil || data.Gatekeeper == nil ||
+		data.Restrictions == nil || len(data.CustomSettingsList) == 0 ||
+		len(data.NetworkList) == 0 || len(data.CredentialsList) == 0 || data.Description.IsNull() {
+		t.Fatal("test setup: liveAppleOsXEntityAllBlocks() must populate every one of the 8 attributes for this test to be meaningful")
+	}
 }
 
 // --- Description Optional+Computed tests ---
@@ -3654,6 +4539,100 @@ func TestProfileResourceCreate_PostCreateGetFails_DescriptionResolved(t *testing
 	// Safety net resolves the unknown to empty string.
 	if model.Description.ValueString() != "" {
 		t.Errorf("expected empty Description when Get fails, got %q", model.Description.ValueString())
+	}
+}
+
+// TestProfileResourceCreate_NoBlocksConfigured verifies that Create for a
+// macOS profile with every one of the 8 nullWhenConfigNull*-modified
+// attributes null (exactly what those modifiers plan for an unconfigured
+// Optional+Computed attribute on Create — never unknown, per internal-task)
+// decodes and completes without a "cannot handle unknown values" error.
+func TestProfileResourceCreate_NoBlocksConfigured(t *testing.T) {
+	t.Parallel()
+
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == "POST" && strings.Contains(r.URL.Path, "/create"):
+			_ = json.NewEncoder(w).Encode(66666)
+		case r.Method == "GET":
+			resp := map[string]interface{}{
+				"General": map[string]interface{}{
+					"ProfileId":              66666,
+					"Name":                   "No Blocks",
+					"ProfileUuid":            "uuid-noblocks",
+					"ProfileContext":         "Device",
+					"ManagedLocationGroupID": 14165,
+				},
+			}
+			_ = json.NewEncoder(w).Encode(resp)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}
+
+	c, server := createTestClient(t, handler)
+	defer server.Close()
+
+	res := &ProfileResource{client: c}
+	ctx := context.Background()
+
+	plan := createResourcePlan(t, map[string]tftypes.Value{
+		"id":                   nullString(),
+		"name":                 stringVal("No Blocks"),
+		"description":          nullString(),
+		"platform":             stringVal("AppleOsX"),
+		"org_group_id":         stringVal("14165"),
+		"assignment_type":      nullString(),
+		"profile_scope":        nullString(),
+		"is_active":            nullBool(),
+		"lock_screen_message":  nullString(),
+		"passcode":             nullPasscode(),
+		"custom_settings_list": nullCustomSettingsList(),
+		"network_list":         nullNetworkList(),
+		"credentials_list":     nullCredentialsList(),
+		"disk_encryption":      nullDiskEncryption(),
+		"gatekeeper":           nullGatekeeper(),
+		"restrictions":         nullRestrictions(),
+		"uuid":                 nullString(),
+		"profile_context":      nullString(),
+	})
+
+	req := resource.CreateRequest{Plan: plan}
+	resp := &resource.CreateResponse{State: emptyResourceState(t)}
+	res.Create(ctx, req, resp)
+
+	if resp.Diagnostics.HasError() {
+		var msgs []string
+		for _, d := range resp.Diagnostics.Errors() {
+			msgs = append(msgs, d.Summary()+": "+d.Detail())
+		}
+		t.Fatalf("unexpected errors creating with no blocks configured: %v", msgs)
+	}
+
+	var model profilemodels.ProfileResourceModel
+	resp.State.Get(ctx, &model)
+	if model.Description.IsUnknown() {
+		t.Error("Description must not be unknown after Create")
+	}
+	// internal-ticket removed setDescriptionFromAPI's null defaulting (row #57 of
+	// the B16 audit): the server's omitted Description now stores as "" (the
+	// SDK can't distinguish "omitted" from an explicit "" on this
+	// non-pointer field), not null.
+	if model.Description.IsNull() || model.Description.ValueString() != "" {
+		t.Errorf("expected Description \"\" (server value as-is, no null defaulting), got %v", model.Description)
+	}
+	if model.Passcode != nil {
+		t.Errorf("expected Passcode nil, got %+v", model.Passcode)
+	}
+	if model.DiskEncryption != nil {
+		t.Errorf("expected DiskEncryption nil, got %+v", model.DiskEncryption)
+	}
+	if model.Gatekeeper != nil {
+		t.Errorf("expected Gatekeeper nil, got %+v", model.Gatekeeper)
+	}
+	if model.Restrictions != nil {
+		t.Errorf("expected Restrictions nil, got %+v", model.Restrictions)
 	}
 }
 
@@ -4074,4 +5053,24 @@ func TestProfileResourceUpdate_WithRestrictions(t *testing.T) {
 	if model.Restrictions.Applications.Camera.AllowUseOfBuiltInCamera.ValueBool() != true {
 		t.Errorf("expected Camera.AllowUseOfBuiltInCamera=true in state")
 	}
+}
+
+// TestProfileResourceSchema_ProfileScopeKeepsStateWhenUnset proves an unset
+// profile_scope keeps its stored value on update instead of planning a
+// change on every update.
+func TestProfileResourceSchema_ProfileScopeKeepsStateWhenUnset(t *testing.T) {
+	r := &ProfileResource{}
+	resp := &resource.SchemaResponse{}
+	r.Schema(context.Background(), resource.SchemaRequest{}, resp)
+	a, ok := resp.Schema.Attributes["profile_scope"].(resourceSchema.StringAttribute)
+	if !ok {
+		t.Fatal("profile_scope: not a StringAttribute")
+	}
+	want := stringplanmodifier.UseStateForUnknown().Description(context.Background())
+	for _, m := range a.PlanModifiers {
+		if m.Description(context.Background()) == want {
+			return
+		}
+	}
+	t.Fatal("profile_scope must keep its stored value when unset (UseStateForUnknown), so an update does not replan it")
 }

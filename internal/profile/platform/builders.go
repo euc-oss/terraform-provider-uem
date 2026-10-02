@@ -3,9 +3,10 @@ package platform
 import (
 	"fmt"
 	"strconv"
+	"strings"
 
 	profilemodels "github.com/euc-oss/terraform-provider-uem/internal/profile/models"
-	sdk "github.com/euc-oss/terraform-sdk-uem"
+	sdk "github.com/euc-oss/terraform-sdk-uem/v26"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 )
 
@@ -38,6 +39,32 @@ func BuildAppleOsXCreateEntity(data *profilemodels.ProfileResourceModel) (*sdk.A
 	}
 	if data.Restrictions != nil {
 		ent.Restrictions = buildAppleOsXRestrictionsEntity(data.Restrictions)
+	}
+	if data.SystemExtensions != nil {
+		ent.SystemExtensions = buildAppleOsXSystemExtensionsEntity(data.SystemExtensions)
+	}
+	if items := buildAppleOsXScepListEntity(data.ScepList); len(items) > 0 {
+		ent.ScepList = items
+	}
+	if items := buildAppleOsXWebClipsListEntity(data.WebClipsList); len(items) > 0 {
+		ent.WebClipsList = items
+	}
+	if items := buildVPNItemList(data.VpnList); len(items) > 0 {
+		ent.VpnList = items
+	}
+	if data.EasMicrosoftOutlook != nil {
+		e := buildEasMicrosoftOutlook(data.EasMicrosoftOutlook)
+		ent.EasMicrosoftOutlook = &e
+	}
+	if items := buildCustomAttributeList(data.CustomAttributes); len(items) > 0 {
+		ent.CustomAttributes = items
+	}
+	if data.KernelExtension != nil {
+		e := buildKernelExtension(data.KernelExtension)
+		ent.KernelExtension = &e
+	}
+	if identities := buildAppleOsXPrivacyPreferencesIdentities(data.PrivacyPreferences); len(identities) > 0 {
+		ent.PrivacyPreferences = &sdk.MacOsPrivacyPreferencesPayloadV2Model{Identities: identities}
 	}
 	return ent, nil
 }
@@ -77,6 +104,8 @@ func BuildGeneralV2Create(data *profilemodels.ProfileResourceModel) *sdk.General
 	if !data.ProfileContext.IsNull() && !data.ProfileContext.IsUnknown() && data.ProfileContext.ValueString() != "" {
 		g.ProfileContext = data.ProfileContext.ValueString()
 	}
+	// ManagedLocationGroupID is non-nullable on every write (canonical OGID
+	// answer); requiring or resolving it when unset is handled separately.
 	if !data.OrgGroupID.IsNull() && !data.OrgGroupID.IsUnknown() {
 		if n, err := strconv.Atoi(data.OrgGroupID.ValueString()); err == nil {
 			g.ManagedLocationGroupID = sdk.IntPtr(n)
@@ -121,16 +150,63 @@ func BuildWindowsRuggedCreateEntity(data *profilemodels.ProfileResourceModel) *s
 	return &sdk.QnxDeviceProfileEntityV2{General: BuildGeneralV2Create(data)}
 }
 
-func BuildLinuxCreateEntity(data *profilemodels.ProfileResourceModel) *sdk.LinuxDeviceProfileEntity1V4 {
-	return &sdk.LinuxDeviceProfileEntity1V4{General: BuildGeneralV4Create(data)}
+func BuildLinuxCreateEntity(data *profilemodels.ProfileResourceModel) (*sdk.LinuxDeviceProfileEntity1V4, error) {
+	general, err := BuildGeneralV4Create(data)
+	if err != nil {
+		return nil, err
+	}
+	return &sdk.LinuxDeviceProfileEntity1V4{General: general}, nil
 }
 
-func BuildGeneralV4Create(data *profilemodels.ProfileResourceModel) *sdk.GeneralPayloadV4Entity {
+// profileScopeWireValues maps the canonical (case-normalized) profile_scope
+// name to the wire integer value expected by the V4 (Linux) API. "Production"
+// -> 1 is directly evidenced by request-template testdata
+// (wifi-create-v4.json / wifi-update-v4.json and api_validation.notes:
+// "General.ProfileScope must be an integer (1)") AND live-confirmed against
+// as<internal-env>.eng.example.com (26.2 tenant) during internal-task. "Staging" -> 2 and
+// "Both" -> 3 follow the confirmed canonical enum ordering
+// (Production, Staging, Both) from the C# server source
+// (DeviceProfileScope, release/26.2.0.0), sourced from doctrine-quirk-17 —
+// but are UNVERIFIED live: no Linux profile existed in the accessible org
+// group scope (138883) at the time of this check to confirm the Staging/Both
+// wire ints against a real server response. Only Production=1 is
+// live-confirmed; Staging=2/Both=3 rest on the C# source mapping only.
+var profileScopeWireValues = map[string]int{
+	"production": 1,
+	"staging":    2,
+	"both":       3,
+}
+
+// profileScopeWireValue maps the TF profile_scope string (case-insensitive)
+// to the wire integer value expected by the V4 (Linux) API. An empty scope
+// (unconfigured, planned unknown on create or carried forward as "" on
+// update) returns (nil, nil): GeneralPayloadV4Entity.
+// ProfileScope is a json:"omitempty" *int, so a nil pointer omits the field
+// from the wire entirely, letting UEM apply its own default instead of this
+// provider guessing one (see the matching V2 comment in resource_crud.go,
+// live-confirmed 2026-09-25 on the 26.2 lab tenant, guarded B16 follow-up
+// create). Any other value not in profileScopeWireValues is an explicit
+// configuration error rather than a guessed mapping.
+func profileScopeWireValue(scope string) (*int, error) {
+	if scope == "" {
+		return nil, nil
+	}
+	if v, ok := profileScopeWireValues[strings.ToLower(scope)]; ok {
+		return sdk.IntPtr(v), nil
+	}
+	return nil, fmt.Errorf("profile_scope %q has no known wire mapping for Linux profiles: only \"Production\", \"Staging\", or \"Both\" are confirmed to map to a wire value", scope)
+}
+
+func BuildGeneralV4Create(data *profilemodels.ProfileResourceModel) (*sdk.GeneralPayloadV4Entity, error) {
+	profileScope, err := profileScopeWireValue(data.ProfileScope.ValueString())
+	if err != nil {
+		return nil, err
+	}
 	g := &sdk.GeneralPayloadV4Entity{
 		Name:           data.Name.ValueString(),
 		Description:    data.Description.ValueString(),
 		AssignmentType: data.AssignmentType.ValueString(),
-		ProfileScope:   data.ProfileScope.ValueString(),
+		ProfileScope:   profileScope,
 	}
 	if !data.IsActive.IsNull() && !data.IsActive.IsUnknown() {
 		g.IsActive = sdk.BoolPtr(data.IsActive.ValueBool())
@@ -138,14 +214,27 @@ func BuildGeneralV4Create(data *profilemodels.ProfileResourceModel) *sdk.General
 	if !data.ProfileContext.IsNull() && !data.ProfileContext.IsUnknown() && data.ProfileContext.ValueString() != "" {
 		g.ProfileContext = data.ProfileContext.ValueString()
 	}
+	// ManagedLocationGroupID is non-nullable on every write (canonical OGID
+	// answer); requiring or resolving it when unset is handled separately.
 	if !data.OrgGroupID.IsNull() && !data.OrgGroupID.IsUnknown() {
 		if n, err := strconv.Atoi(data.OrgGroupID.ValueString()); err == nil {
 			g.ManagedLocationGroupID = sdk.IntPtr(n)
 		}
 	}
-	return g
+	return g, nil
 }
 
+// StampGeneralV2 always forces CreateNewVersion=true and bumps Version on
+// every update. UEM source: AirWatch API/AW.Mdm.Api/AW.Mdm.Api/Helper/Profiles/ProfileServiceV2Helper.cs:1035-1041,3443-3448,1650-1654
+// (canonical Q6) confirms CreateNewVersion's two semantics generally
+// (true = rebuild from request only, omitted/null lists replace/clear;
+// false = keep existing entity, General-only properties update, credentials
+// and network lists left unchanged) and that this provider's update path
+// always chooses the "true" (rebuild) semantics — matching
+// OverlayAppleOsXUpdateEntity's full live-entity + plan overlay strategy in
+// resource_update_osx.go — but does not itself require forcing true on
+// every update rather than sometimes taking the false (General-only) path;
+// this row is only partially answered.
 func StampGeneralV2(g *sdk.GeneralPayloadV2Entity, profileID int, currentVersion *int) {
 	if g == nil {
 		return
@@ -401,8 +490,8 @@ func buildAppleOsXDiskEncryptionEntity(m *profilemodels.DiskEncryptionModel) *sd
 	if m.FileVault != nil {
 		out.DiskEncryptionFileVault2 = buildAppleOsXDiskEncryptionFileVault2Entity(m.FileVault)
 	}
-	if m.MCX != nil {
-		out.DiskEncryptionMCX = buildAppleOsXDiskEncryptionMCXEntity(m.MCX)
+	if mcx := buildAppleOsXDiskEncryptionMCXEntity(m.MCX); mcx != nil {
+		out.DiskEncryptionMCX = mcx
 	}
 	return out
 }
@@ -424,7 +513,11 @@ func buildAppleOsXDiskEncryptionAirWatchEntity(m *profilemodels.DiskEncryptionAi
 		out.EncryptionNotificationRetryIntervalInHours = sdk.IntPtr(int(m.EncryptionNotificationRetryIntervalInHours.ValueInt64()))
 	}
 	if !m.EncryptionActionAfterLastNotification.IsNull() && !m.EncryptionActionAfterLastNotification.IsUnknown() {
-		out.EncryptionActionAfterLastNotification = strconv.FormatInt(m.EncryptionActionAfterLastNotification.ValueInt64(), 10)
+		// MacOsEncryptionAction also carries StringEnumConverter (canonical
+		// rules Q3/Q4): send the enum name string, not the raw int.
+		if name, ok := encryptionActionAfterLastNotificationNames[m.EncryptionActionAfterLastNotification.ValueInt64()]; ok {
+			out.EncryptionActionAfterLastNotification = name
+		}
 	}
 	out.EnableRecoveryKey = boolPtrFromTF(m.EnableRecoveryKey)
 	setStringIfKnown(&out.RecoveryKeyNotificationTitle, m.RecoveryKeyNotificationTitle)
@@ -444,6 +537,34 @@ func buildAppleOsXDiskEncryptionAirWatchEntity(m *profilemodels.DiskEncryptionAi
 	return out
 }
 
+// fileVaultUserNames maps the schema's Int64 filevault_user encoding to the
+// exact MacOsFileVaultUser enum name string UEM's StringEnumConverter
+// expects on the wire (canonical rules Q3/Q4). RecoveryType stays a plain
+// int both ways (Q3: "RecoveryType is int, not an enum") and is NOT in this
+// map.
+var fileVaultUserNames = map[int64]string{
+	1: "CurrentOrNextLoginUser",
+	2: "SpecificUser",
+}
+
+// promptToEnableFileVaultAtNames maps the schema's Int64
+// prompt_to_enable_filevault_at encoding to the exact
+// MacOsTimeOfPromptToEnableFileVault enum name string (canonical rules
+// Q3/Q4).
+var promptToEnableFileVaultAtNames = map[int64]string{
+	1: "BothLoginAndLogout",
+	2: "LogoutOnly",
+	3: "LoginOnly",
+}
+
+// encryptionActionAfterLastNotificationNames maps the schema's Int64
+// encryption_action_after_last_notification encoding to the exact
+// MacOsEncryptionAction enum name string (canonical rules Q3/Q4).
+var encryptionActionAfterLastNotificationNames = map[int64]string{
+	1: "ForceLogout",
+	2: "DoNothing",
+}
+
 func buildAppleOsXDiskEncryptionFileVault2Entity(m *profilemodels.DiskEncryptionFileVaultModel) *sdk.AppleOsXDiskEncryptionFileVault2PayloadEntityV2 {
 	out := &sdk.AppleOsXDiskEncryptionFileVault2PayloadEntityV2{}
 	out.Enable = boolPtrFromTF(m.Enable)
@@ -453,11 +574,20 @@ func buildAppleOsXDiskEncryptionFileVault2Entity(m *profilemodels.DiskEncryption
 	}
 	setStringIfKnown(&out.FileVaultEnterpriseCertificate, m.FileVaultEnterpriseCertificate)
 	if !m.FileVaultUser.IsNull() && !m.FileVaultUser.IsUnknown() {
-		out.FileVaultUser = strconv.FormatInt(m.FileVaultUser.ValueInt64(), 10)
+		// UEM's FileVaultUser property carries [JsonConverter(typeof(StringEnumConverter))],
+		// so the wire format is the enum name string, not the schema's raw int
+		// (canonical rules Q3/Q4). An out-of-range value can't reach here: the
+		// schema's int64validator.OneOf(1, 2) rejects it at plan time.
+		if name, ok := fileVaultUserNames[m.FileVaultUser.ValueInt64()]; ok {
+			out.FileVaultUser = name
+		}
 	}
 	setStringIfKnown(&out.Username, m.Username)
 	if !m.PromptToEnableFileVaultAt.IsNull() && !m.PromptToEnableFileVaultAt.IsUnknown() {
-		out.PromptToEnableFileVaultAt = strconv.FormatInt(m.PromptToEnableFileVaultAt.ValueInt64(), 10)
+		// Same StringEnumConverter treatment as FileVaultUser above.
+		if name, ok := promptToEnableFileVaultAtNames[m.PromptToEnableFileVaultAt.ValueInt64()]; ok {
+			out.PromptToEnableFileVaultAt = name
+		}
 	}
 	if !m.NumberOfTimesUserCanBypass.IsNull() && !m.NumberOfTimesUserCanBypass.IsUnknown() {
 		out.NumberOfTimesUserCanBypass = sdk.IntPtr(int(m.NumberOfTimesUserCanBypass.ValueInt64()))
@@ -465,9 +595,24 @@ func buildAppleOsXDiskEncryptionFileVault2Entity(m *profilemodels.DiskEncryption
 	return out
 }
 
-func buildAppleOsXDiskEncryptionMCXEntity(m *profilemodels.DiskEncryptionMCXModel) *sdk.AppleOsXDiskEncryptionMCXPayloadEntityV2 {
+// buildAppleOsXDiskEncryptionMCXEntity builds the DiskEncryptionMCX request
+// entity from the mcx types.Object. A null or unknown object (config omitted
+// mcx, including create's genuinely-unknown plan value -- see
+// DiskEncryptionModel.MCX's doc comment) means omit DiskEncryptionMCX from
+// the request entirely and let UEM apply its own default (B42 follow-up,
+// live-confirmed as<internal-env> UEM 26.2). A known object is built from its leaf
+// value; an unknown or null leaf is likewise omitted from the sub-entity so
+// UEM fills its own default for that one field.
+func buildAppleOsXDiskEncryptionMCXEntity(o types.Object) *sdk.AppleOsXDiskEncryptionMCXPayloadEntityV2 {
+	if o.IsNull() || o.IsUnknown() {
+		return nil
+	}
+	destroy, ok := o.Attributes()["destroy_fv_key_on_standby"].(types.Bool)
+	if !ok {
+		destroy = types.BoolNull()
+	}
 	return &sdk.AppleOsXDiskEncryptionMCXPayloadEntityV2{
-		DestroyFVKeyOnStandby: boolPtrFromTF(m.DestroyFVKeyOnStandby),
+		DestroyFVKeyOnStandby: boolPtrFromTF(destroy),
 	}
 }
 
@@ -713,4 +858,143 @@ func buildAppleOsXGatekeeperEntity(m *profilemodels.GatekeeperModel) *sdk.MacOsG
 		out.EnforcedSoftwareUpdateDelay = sdk.IntPtr(int(m.EnforcedSoftwareUpdateDelay.ValueInt64()))
 	}
 	return out
+}
+
+func buildAppleOsXSystemExtensionsEntity(m *profilemodels.SystemExtensionsModel) *sdk.MacOsSystemExtensionsPayloadV2Model {
+	out := &sdk.MacOsSystemExtensionsPayloadV2Model{}
+	out.AllowUserOverrides = boolPtrFromTF(m.AllowUserOverrides)
+	if len(m.AllowedSystemExtensionTypes) > 0 {
+		allowedTypes := make([]sdk.MacOsAllowedSystemExtensionTypesV2Model, 0, len(m.AllowedSystemExtensionTypes))
+		for _, t := range m.AllowedSystemExtensionTypes {
+			var item sdk.MacOsAllowedSystemExtensionTypesV2Model
+			setStringIfKnown(&item.TeamIdentifier, t.TeamIdentifier)
+			item.AllowDriverExtensionType = boolPtrFromTF(t.AllowDriverExtensionType)
+			item.AllowEndpointSecurityExtensionType = boolPtrFromTF(t.AllowEndpointSecurityExtensionType)
+			item.AllowNetworkExtensionType = boolPtrFromTF(t.AllowNetworkExtensionType)
+			allowedTypes = append(allowedTypes, item)
+		}
+		out.AllowedSystemExtensionTypes = allowedTypes
+	}
+	if len(m.AllowedSystemExtensions) > 0 {
+		exts := make([]sdk.MacOsAllowedSystemExtensionV2Model, 0, len(m.AllowedSystemExtensions))
+		for _, e := range m.AllowedSystemExtensions {
+			var item sdk.MacOsAllowedSystemExtensionV2Model
+			setStringIfKnown(&item.BundleIdentifier, e.BundleIdentifier)
+			setStringIfKnown(&item.TeamIdentifier, e.TeamIdentifier)
+			exts = append(exts, item)
+		}
+		out.AllowedSystemExtensions = exts
+	}
+	return out
+}
+
+func buildAppleOsXPrivacyPreferencesIdentities(items []profilemodels.PrivacyPreferenceModel) []sdk.MacOsPrivacyPreferencesV2Model {
+	if len(items) == 0 {
+		return nil
+	}
+	result := make([]sdk.MacOsPrivacyPreferencesV2Model, 0, len(items))
+	for _, m := range items {
+		result = append(result, buildAppleOsXPrivacyPreferenceIdentity(&m))
+	}
+	return result
+}
+
+func buildAppleOsXPrivacyPreferenceIdentity(m *profilemodels.PrivacyPreferenceModel) sdk.MacOsPrivacyPreferencesV2Model {
+	var it sdk.MacOsPrivacyPreferencesV2Model
+	setStringIfKnown(&it.Identifier, m.Identifier)
+	setStringIfKnown(&it.IdentifierType, m.IdentifierType)
+	setStringIfKnown(&it.CodeRequirement, m.CodeRequirement)
+	setStringIfKnown(&it.Comment, m.Comment)
+	// AEReceiverIdentifier/AEReceiverIdentifierType/AEReceiverCodeRequirement
+	// and the coarse-grained AppleEvents field are never set here: UEM folds
+	// an identity-level Apple Events receiver into AppleEventsList on write
+	// (storing 2 identical entries when both forms are sent) and never
+	// repopulates the identity-level fields on read (canonical answer from
+	// the SDK team, MacOsPrivacyPreferencesV2Model.cs:274-283). Only
+	// AppleEventsList is supported.
+	if events := buildAppleEventsList(m.AppleEventsList); len(events) > 0 {
+		it.AppleEventsList = events
+	}
+	it.StaticCode = boolPtrFromTF(m.StaticCode)
+	setStringIfKnown(&it.Accessibility, m.Accessibility)
+	setStringIfKnown(&it.AddressBook, m.AddressBook)
+	setStringIfKnown(&it.Calendar, m.Calendar)
+	setStringIfKnown(&it.Camera, m.Camera)
+	setStringIfKnown(&it.FileProviderPresence, m.FileProviderPresence)
+	setStringIfKnown(&it.ListenEvent, m.ListenEvent)
+	setStringIfKnown(&it.MediaLibrary, m.MediaLibrary)
+	setStringIfKnown(&it.Microphone, m.Microphone)
+	setStringIfKnown(&it.Photos, m.Photos)
+	setStringIfKnown(&it.PostEvent, m.PostEvent)
+	setStringIfKnown(&it.Reminders, m.Reminders)
+	setStringIfKnown(&it.ScreenCapture, m.ScreenCapture)
+	setStringIfKnown(&it.SpeechRecognition, m.SpeechRecognition)
+	setStringIfKnown(&it.SystemPolicyAllFiles, m.SystemPolicyAllFiles)
+	setStringIfKnown(&it.SystemPolicyDesktopFolder, m.SystemPolicyDesktopFolder)
+	setStringIfKnown(&it.SystemPolicyDocumentsFolder, m.SystemPolicyDocumentsFolder)
+	setStringIfKnown(&it.SystemPolicyDownloadsFolder, m.SystemPolicyDownloadsFolder)
+	setStringIfKnown(&it.SystemPolicyNetworkVolumes, m.SystemPolicyNetworkVolumes)
+	setStringIfKnown(&it.SystemPolicyRemovableVolumes, m.SystemPolicyRemovableVolumes)
+	setStringIfKnown(&it.SystemPolicySysAdminFiles, m.SystemPolicySysAdminFiles)
+	return it
+}
+
+func buildAppleEventsList(items []profilemodels.AppleEventModel) []sdk.AppleEventV2 {
+	if len(items) == 0 {
+		return nil
+	}
+	result := make([]sdk.AppleEventV2, 0, len(items))
+	for _, e := range items {
+		var item sdk.AppleEventV2
+		setStringIfKnown(&item.CodeRequirement, e.CodeRequirement)
+		setStringIfKnown(&item.Identifier, e.Identifier)
+		setStringIfKnown(&item.IdentifierType, e.IdentifierType)
+		setStringIfKnown(&item.Permission, e.Permission)
+		result = append(result, item)
+	}
+	return result
+}
+
+func buildAppleOsXScepListEntity(items []profilemodels.ScepItemModel) []sdk.AppleOsXScepPayloadEntityV2 {
+	if len(items) == 0 {
+		return nil
+	}
+	result := make([]sdk.AppleOsXScepPayloadEntityV2, 0, len(items))
+	for i := range items {
+		it := &items[i]
+		var out sdk.AppleOsXScepPayloadEntityV2
+		setStringIfKnown(&out.Name, it.Name)
+		setStringIfKnown(&out.CredentialSource, it.CredentialSource)
+		if !it.CertificateAuthorityID.IsNull() && !it.CertificateAuthorityID.IsUnknown() {
+			out.CertificateAuthorityID = sdk.IntPtr(int(it.CertificateAuthorityID.ValueInt64()))
+		}
+		if !it.CertificateTemplateID.IsNull() && !it.CertificateTemplateID.IsUnknown() {
+			out.CertificateTemplateID = sdk.IntPtr(int(it.CertificateTemplateID.ValueInt64()))
+		}
+		out.AllowExportFromKeyChain = boolPtrFromTF(it.AllowExportFromKeyChain)
+		if it.IdentityPreference != nil {
+			out.IdentityPreference = &sdk.MacOsScepIdentityPreferencePayloadV2Model{Names: stringSliceFromTFList(it.IdentityPreference.Names)}
+		}
+		result = append(result, out)
+	}
+	return result
+}
+
+func buildAppleOsXWebClipsListEntity(items []profilemodels.WebClipItemModel) []sdk.MacOsWebClipsPayloadV2Entity {
+	if len(items) == 0 {
+		return nil
+	}
+	result := make([]sdk.MacOsWebClipsPayloadV2Entity, 0, len(items))
+	for i := range items {
+		it := &items[i]
+		var out sdk.MacOsWebClipsPayloadV2Entity
+		setStringIfKnown(&out.Label, it.Label)
+		setStringIfKnown(&out.URL, it.URL)
+		out.ShowInAppCatalog = boolPtrFromTF(it.ShowInAppCatalog)
+		if !it.Icon.IsNull() && !it.Icon.IsUnknown() {
+			out.Icon = sdk.IntPtr(int(it.Icon.ValueInt64()))
+		}
+		result = append(result, out)
+	}
+	return result
 }

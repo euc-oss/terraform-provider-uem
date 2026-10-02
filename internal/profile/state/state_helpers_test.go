@@ -7,90 +7,92 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/types"
 )
 
-// Regression: when state declared recordable_disc.burn_support but the UEM
-// server omitted RecordableDisc from its GET response, the merge previously
-// left api.RecordableDisc as nil — Terraform then raised "inconsistent result
-// after apply". The merge must rehydrate the block from prior state.
-func TestMergeRestrictionsMedia_RehydratesRecordableDiscFromState(t *testing.T) {
-	state := &profilemodels.RestrictionsMediaModel{
-		RecordableDisc: &profilemodels.RestrictionsBurnSupportModel{
-			BurnSupport: &profilemodels.RestrictionsMediaAccessModel{
-				Allow:        types.BoolValue(false),
-				Authenticate: types.BoolValue(false),
-				ReadOnly:     types.BoolValue(false),
+// internal-ticket removed mergeRestrictionsMedia and mergeMediaAccessPtr (row #95
+// of the B16 audit): UEM's response for Media/RecordableDisc/BurnSupport is
+// no longer rehydrated from the prior state when the API omits it -- that
+// fabricated a media-access block (including a CD/DVD read_only value) out
+// of thin air, in tension with the CD/DVD read_only=true validator. The
+// tests below assert the new pass-through contract on
+// MergeRestrictionsWithPriorState directly: only Desktop still gets
+// restored from prior state when the API omits it (row #92, kept, (a)).
+
+// A server that drops Media/RecordableDisc entirely (nil) is no longer
+// rehydrated from the prior state -- this used to be
+// TestMergeRestrictionsMedia_RehydratesRecordableDiscFromState, asserting
+// the opposite of the current contract.
+func TestMergeRestrictionsWithPriorState_MediaNotRehydratedFromState(t *testing.T) {
+	t.Parallel()
+
+	state := &profilemodels.RestrictionsModel{
+		Media: &profilemodels.RestrictionsMediaModel{
+			RecordableDisc: &profilemodels.RestrictionsBurnSupportModel{
+				BurnSupport: &profilemodels.RestrictionsMediaAccessModel{
+					Allow: types.BoolValue(false),
+				},
 			},
 		},
 	}
-	api := &profilemodels.RestrictionsMediaModel{} // server dropped RecordableDisc
+	api := &profilemodels.RestrictionsModel{} // server omitted Media entirely
 
-	mergeRestrictionsMedia(api, state)
+	got := MergeRestrictionsWithPriorState(api, state)
 
-	if api.RecordableDisc == nil {
-		t.Fatal("api.RecordableDisc was not rehydrated from state")
-	}
-	if api.RecordableDisc.BurnSupport == nil {
-		t.Fatal("api.RecordableDisc.BurnSupport was not rehydrated from state")
-	}
-	bs := api.RecordableDisc.BurnSupport
-	if bs.Allow.IsNull() || bs.Allow.ValueBool() != false {
-		t.Errorf("Allow: want false, got %v", bs.Allow)
-	}
-	if bs.Authenticate.IsNull() || bs.Authenticate.ValueBool() != false {
-		t.Errorf("Authenticate: want false, got %v", bs.Authenticate)
-	}
-	if bs.ReadOnly.IsNull() || bs.ReadOnly.ValueBool() != false {
-		t.Errorf("ReadOnly: want false, got %v", bs.ReadOnly)
+	if got != nil && got.Media != nil {
+		t.Errorf("Media = %+v, want nil (no longer fabricated from prior state)", got.Media)
 	}
 }
 
-// State-nil must continue to clear the api block (user removed the setting).
-func TestMergeRestrictionsMedia_StateNilClearsRecordableDisc(t *testing.T) {
-	state := &profilemodels.RestrictionsMediaModel{}
-	api := &profilemodels.RestrictionsMediaModel{
-		RecordableDisc: &profilemodels.RestrictionsBurnSupportModel{
-			BurnSupport: &profilemodels.RestrictionsMediaAccessModel{
-				Allow: types.BoolValue(true),
+// Desktop is the one sub-block still restored from the prior state when the
+// API omits it (R + GGS:43, confirmed live: Desktop is null on GET unless
+// locked).
+func TestMergeRestrictionsWithPriorState_DesktopStillRehydratedFromState(t *testing.T) {
+	t.Parallel()
+
+	state := &profilemodels.RestrictionsModel{
+		Desktop: &profilemodels.RestrictionsDesktopModel{
+			LockDesktopPicture: types.BoolValue(true),
+		},
+	}
+	api := &profilemodels.RestrictionsModel{Applications: &profilemodels.RestrictionsApplicationsModel{}}
+
+	got := MergeRestrictionsWithPriorState(api, state)
+
+	if got == nil || got.Desktop == nil {
+		t.Fatal("Desktop was not restored from prior state")
+	}
+	if got.Desktop.LockDesktopPicture.ValueBool() != true {
+		t.Errorf("Desktop.LockDesktopPicture = %v, want true (restored from prior state)", got.Desktop.LockDesktopPicture)
+	}
+}
+
+// When the API does return Media, it is stored exactly as returned -- no
+// merge against the prior state's RecordableDisc/BurnSupport values.
+func TestMergeRestrictionsWithPriorState_MediaPassesThroughAPIValue(t *testing.T) {
+	t.Parallel()
+
+	state := &profilemodels.RestrictionsModel{
+		Media: &profilemodels.RestrictionsMediaModel{
+			RecordableDisc: &profilemodels.RestrictionsBurnSupportModel{
+				BurnSupport: &profilemodels.RestrictionsMediaAccessModel{
+					Allow: types.BoolValue(false),
+				},
 			},
 		},
 	}
-
-	mergeRestrictionsMedia(api, state)
-
-	if api.RecordableDisc != nil {
-		t.Errorf("expected RecordableDisc cleared when state is nil, got %+v", api.RecordableDisc)
+	api := &profilemodels.RestrictionsModel{
+		Media: &profilemodels.RestrictionsMediaModel{
+			AutoEjectMedia: types.BoolValue(true),
+		},
 	}
-}
 
-// mergeMediaAccessPtr must rehydrate a dropped media-access struct from state.
-// Same class of bug as recordable_disc, one level shallower.
-func TestMergeMediaAccessPtr_RehydratesFromState(t *testing.T) {
-	state := &profilemodels.RestrictionsMediaAccessModel{
-		Allow:        types.BoolValue(true),
-		Authenticate: types.BoolValue(false),
-		ReadOnly:     types.BoolValue(true),
-	}
-	var api *profilemodels.RestrictionsMediaAccessModel
+	got := MergeRestrictionsWithPriorState(api, state)
 
-	mergeMediaAccessPtr(&api, state)
-
-	if api == nil {
-		t.Fatal("api was not rehydrated from state")
+	if got == nil || got.Media == nil {
+		t.Fatal("expected Media to pass through")
 	}
-	if api.Allow.ValueBool() != true {
-		t.Errorf("Allow: want true, got %v", api.Allow)
+	if got.Media.AutoEjectMedia.ValueBool() != true {
+		t.Errorf("AutoEjectMedia = %v, want true (API value)", got.Media.AutoEjectMedia)
 	}
-	if api.Authenticate.ValueBool() != false {
-		t.Errorf("Authenticate: want false, got %v", api.Authenticate)
-	}
-	if api.ReadOnly.ValueBool() != true {
-		t.Errorf("ReadOnly: want true, got %v", api.ReadOnly)
-	}
-}
-
-func TestMergeMediaAccessPtr_StateNilClearsApi(t *testing.T) {
-	api := &profilemodels.RestrictionsMediaAccessModel{Allow: types.BoolValue(true)}
-	mergeMediaAccessPtr(&api, nil)
-	if api != nil {
-		t.Errorf("expected api cleared when state is nil, got %+v", api)
+	if got.Media.RecordableDisc != nil {
+		t.Errorf("RecordableDisc = %+v, want nil (not fabricated from prior state)", got.Media.RecordableDisc)
 	}
 }

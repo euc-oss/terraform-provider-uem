@@ -25,9 +25,9 @@ func main() {
 	flag.Parse()
 
 	opts := providerserver.ServeOpts{
-		// TODO: Update this string with the published name of your provider.
-		// Also update the tfplugindocs generate command to either remove the
-		// -provider-name flag or set its value to the updated provider name.
+		// registry.terraform.io/omnissa/uem — matches the required_providers source in a consuming
+		// Terraform configuration and the dev_overrides key in a local CLI config. It resolves against
+		// the real Terraform Registry only once the provider is published there.
 		Address: "registry.terraform.io/omnissa/uem",
 		Debug:   debug,
 	}

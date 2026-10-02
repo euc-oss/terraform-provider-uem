@@ -6,7 +6,7 @@ import (
 
 	commonerrors "github.com/euc-oss/terraform-provider-uem/internal/common/errors"
 	profileplatform "github.com/euc-oss/terraform-provider-uem/internal/profile/platform"
-	sdk "github.com/euc-oss/terraform-sdk-uem"
+	sdk "github.com/euc-oss/terraform-sdk-uem/v26"
 )
 
 var supportedImportPlatforms = profileplatform.SupportedImportPlatforms
@@ -24,8 +24,12 @@ type resourceConfigData struct {
 	newProfileService func(ctx context.Context, c *sdk.Client) (profileServiceAPI, error)
 }
 
-func defaultProfileServiceFactory(ctx context.Context, c *sdk.Client) (profileServiceAPI, error) {
-	return sdk.NewProfileService(ctx, c)
+// defaultProfileServiceFactory builds the profile service without the eager
+// Discover (a full /api/mdm/profiles/search listing). Every Get/Update/Delete
+// path RegisterEntry's the (id, platform) from plan or state first, and Create
+// registers the new id itself, so discovery would only cost a search call.
+func defaultProfileServiceFactory(_ context.Context, c *sdk.Client) (profileServiceAPI, error) {
+	return sdk.NewProfileServiceWithoutDiscovery(c), nil
 }
 
 func isNotFoundAPIError(err error) bool {
