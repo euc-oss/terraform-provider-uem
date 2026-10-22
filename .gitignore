@@ -57,8 +57,5 @@ website/vendor
 go.work
 go.work.sum
 
-# dev local files
-dev-docs/
-
 # build artifacts
 terraform-provider-uem

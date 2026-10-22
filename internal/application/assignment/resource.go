@@ -6,7 +6,7 @@ import (
 	"strings"
 	"sync"
 
-	sdk "github.com/euc-oss/terraform-sdk-uem"
+	sdk "github.com/euc-oss/terraform-sdk-uem/v26"
 	"github.com/hashicorp/terraform-plugin-framework/attr"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
@@ -61,8 +61,73 @@ func (r *applicationAssignmentResource) appAssignmentService(ctx context.Context
 // have been removed as they are not currently used in the schema.
 // If needed in future, they can be restored from git history.
 
+// nullWhenConfigNullListModifier plans an Optional+Computed List attribute as
+// an explicit typed null whenever the configuration omits it — whether or
+// not prior state held a value. This is what makes removing the attribute
+// from HCL (e.g. excluded_smart_groups) plan as NULL instead of carrying the
+// prior value forward: the Update path is a full-replace PUT, and UEM resets
+// any omitted field to its server default, so a null plan is what actually
+// clears the field on apply (mirrors internal/profile/resource.go's
+// nullWhenConfigNull* modifiers for internal-task). Unknown config (e.g. fed by
+// a not-yet-known variable) is left untouched so the plan can stay unknown.
+// Live-confirmed 2026-09-23 on as<internal-env> 26.2: UEM's assignment-rules PUT is a
+// full replace that never keeps an omitted field (excluded groups reset to
+// [], delivery method to ON_DEMAND, effective_date to NOW); internal
+// delivery-method and effective_date/excluded-groups removal were each
+// separately confirmed to clear on apply. Evidence:
+// internal-design-doc
+type nullWhenConfigNullListModifier struct{}
+
+func (m nullWhenConfigNullListModifier) Description(_ context.Context) string {
+	return "Plans this attribute as null whenever it is omitted from configuration, so removing it from HCL clears it on apply instead of preserving the prior value."
+}
+
+func (m nullWhenConfigNullListModifier) MarkdownDescription(ctx context.Context) string {
+	return m.Description(ctx)
+}
+
+func (m nullWhenConfigNullListModifier) PlanModifyList(ctx context.Context, req planmodifier.ListRequest, resp *planmodifier.ListResponse) {
+	if req.ConfigValue.IsNull() {
+		resp.PlanValue = types.ListNull(req.PlanValue.ElementType(ctx))
+	}
+}
+
+func nullWhenConfigNullList() planmodifier.List {
+	return nullWhenConfigNullListModifier{}
+}
+
+// nullWhenConfigNullStringModifier is the String-typed equivalent of
+// nullWhenConfigNullListModifier — see its doc comment for the removal
+// semantics (internal-task). Used for distribution.app_delivery_method and
+// distribution.effective_date, called by the framework once per assignments
+// list element since those are nested attributes.
+type nullWhenConfigNullStringModifier struct{}
+
+func (m nullWhenConfigNullStringModifier) Description(_ context.Context) string {
+	return "Plans this attribute as null whenever it is omitted from configuration, so removing it from HCL clears it on apply instead of preserving the prior value."
+}
+
+func (m nullWhenConfigNullStringModifier) MarkdownDescription(ctx context.Context) string {
+	return m.Description(ctx)
+}
+
+func (m nullWhenConfigNullStringModifier) PlanModifyString(_ context.Context, req planmodifier.StringRequest, resp *planmodifier.StringResponse) {
+	if req.ConfigValue.IsNull() {
+		resp.PlanValue = types.StringNull()
+	}
+}
+
+func nullWhenConfigNullString() planmodifier.String {
+	return nullWhenConfigNullStringModifier{}
+}
+
 // normalizeLowercaseStringListModifier canonicalizes configured string lists
 // to lowercase so case-only differences do not produce perpetual diffs.
+//
+// B16 decision table row #146 (KEEP). UEM source: routes bind UUIDs as
+// Guid/{uuid:guid} (canonical Q14): Guid parsing is case-insensitive with no
+// stable echo-case guarantee from the server — harmless client-side
+// normalization for stable diffs, not a server-mandated rule.
 type normalizeLowercaseStringListModifier struct{}
 
 func (m normalizeLowercaseStringListModifier) Description(_ context.Context) string {
@@ -136,15 +201,23 @@ func (r *applicationAssignmentResource) Schema(ctx context.Context, req resource
 
 			"application_uuid": schema.StringAttribute{
 				Required: true,
+				MarkdownDescription: "UUID of the application this assignment rule applies to. Changing this " +
+					"targets a different application's assignment rule (the UEM assignment API is scoped per " +
+					"application UUID) rather than updating the current one in place, so it forces replacement — " +
+					"otherwise `id` (which mirrors application_uuid) would change across what Terraform planned " +
+					"as an in-place update, which the framework rejects as an inconsistent provider result.",
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.RequiresReplace(),
+				},
 			},
 
 			"excluded_smart_groups": schema.ListAttribute{
 				Optional:    true,
 				ElementType: types.StringType,
 				Computed:    true,
-				//PlanModifiers: []planmodifier.List{
-				//	normalizeLowercaseStringList(),
-				//},
+				PlanModifiers: []planmodifier.List{
+					nullWhenConfigNullList(),
+				},
 			},
 
 			"assignments": schema.ListNestedAttribute{
@@ -172,11 +245,18 @@ func (r *applicationAssignmentResource) Schema(ctx context.Context, req resource
 								"app_delivery_method": schema.StringAttribute{
 									Optional: true,
 									Computed: true,
+									PlanModifiers: []planmodifier.String{
+										nullWhenConfigNullString(),
+									},
 								},
 								"effective_date": schema.StringAttribute{
+									MarkdownDescription: "RFC3339 effective date. When unset at create, UEM stamps the current date; an import captures the date UEM has. Set it explicitly to pin it. Removing it from the configuration lets UEM re-stamp it at the next apply.",
 									// Required: true,
 									Optional: true,
 									Computed: true,
+									PlanModifiers: []planmodifier.String{
+										nullWhenConfigNullString(),
+									},
 								},
 							},
 						},

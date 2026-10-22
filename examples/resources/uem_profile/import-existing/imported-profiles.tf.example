@@ -1,0 +1,145 @@
+# Example: Importing Existing Workspace ONE Profiles
+# 
+# The import script auto-generates complete .tf files with all settings from
+# the imported profile so you can manage brownfield resources immediately.
+#
+# Steps:
+# 1. Run: ./import-profiles.sh <resource_name> <profile_id> <platform>
+#    This imports the profile AND generates a complete .tf file with all settings.
+# 2. Review the generated import-temp-<resource_name>.tf file
+# 3. Run terraform plan to verify no drift
+# 4. Modify settings as needed, then run terraform apply
+
+# This provider is not yet published to the Terraform Registry; install it
+# from the pre-release mirror zip (see the project README) before running
+# `terraform init`. For local development, see "Developing the provider
+# locally" in the README for the dev_overrides workflow.
+terraform {
+  required_version = ">= 1.0"
+
+  required_providers {
+    uem = {
+      source = "registry.terraform.io/omnissa/uem"
+    }
+  }
+}
+
+provider "uem" {
+  # Configuration loaded from .env file
+}
+
+# Variable for Organization Group ID
+variable "org_group_id" {
+  description = "Workspace ONE Organization Group ID"
+  type        = string
+  default     = "12345"  # Update with your ORG_GROUP_ID from .env
+}
+
+# ============================================================================
+# ANDROID PROFILES
+# ============================================================================
+
+# Corporate Android Profile (Production)
+# Import command: ./import-profiles.sh android_corporate 12345
+resource "uem_profile" "android_corporate" {
+  name             = "Corporate Android Profile"
+  description      = "Corporate Android devices - Production"
+  platform         = "Android"
+  org_group_id     = var.org_group_id
+  assignment_type  = "Auto"
+  profile_scope    = "Production"
+  is_active        = true
+  
+  lock_screen_message = "This device is managed by IT. Contact helpdesk@company.com"
+}
+
+# BYOD Android Profile (Optional)
+# Import command: ./import-profiles.sh android_byod 12348
+resource "uem_profile" "android_byod" {
+  name             = "BYOD Android Profile"
+  description      = "Bring Your Own Device - Android"
+  platform         = "Android"
+  org_group_id     = var.org_group_id
+  assignment_type  = "Optional"
+  profile_scope    = "Production"
+  is_active        = true
+  
+  lock_screen_message = "Personal device - Managed apps only"
+}
+
+# ============================================================================
+# iOS PROFILES
+# ============================================================================
+
+# Corporate iOS Profile (Production)
+# Import command: ./import-profiles.sh ios_corporate 12349
+resource "uem_profile" "ios_corporate" {
+  name             = "Corporate iOS Profile"
+  description      = "Corporate iOS devices - Production"
+  platform         = "Apple iOS"
+  org_group_id     = var.org_group_id
+  assignment_type  = "Auto"
+  profile_scope    = "Production"
+  is_active        = true
+}
+
+# BYOD iOS Profile (Optional)
+# Import command: ./import-profiles.sh ios_byod 12350
+resource "uem_profile" "ios_byod" {
+  name             = "BYOD iOS Profile"
+  description      = "Bring Your Own Device - iOS"
+  platform         = "Apple iOS"
+  org_group_id     = var.org_group_id
+  assignment_type  = "Optional"
+  profile_scope    = "Production"
+  is_active        = true
+}
+
+# ============================================================================
+# WINDOWS PROFILES
+# ============================================================================
+
+# Corporate Windows 10 Profile
+# Import command: ./import-profiles.sh windows_corporate 12351
+resource "uem_profile" "windows_corporate" {
+  name             = "Corporate Windows 10 Profile"
+  description      = "Corporate Windows 10 devices"
+  platform         = "Windows 10"
+  org_group_id     = var.org_group_id
+  assignment_type  = "Auto"
+  profile_scope    = "Production"
+  is_active        = true
+}
+
+# ============================================================================
+# macOS PROFILES
+# ============================================================================
+
+# Corporate macOS Profile
+# Import command: ./import-profiles.sh macos_corporate 12352
+resource "uem_profile" "macos_corporate" {
+  name             = "Corporate macOS Profile"
+  description      = "Corporate macOS devices"
+  platform         = "AppleOsX"
+  org_group_id     = var.org_group_id
+  assignment_type  = "Auto"
+  profile_scope    = "Production"
+  is_active        = true
+}
+
+# ============================================================================
+# OUTPUTS
+# ============================================================================
+
+output "imported_profiles" {
+  description = "All imported profile IDs"
+  value = {
+    android_corporate = uem_profile.android_corporate.id
+    android_byod      = uem_profile.android_byod.id
+    ios_corporate     = uem_profile.ios_corporate.id
+    ios_byod          = uem_profile.ios_byod.id
+    windows_corporate = uem_profile.windows_corporate.id
+    macos_corporate   = uem_profile.macos_corporate.id
+  }
+}
+

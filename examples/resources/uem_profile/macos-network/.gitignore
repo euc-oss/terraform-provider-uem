@@ -1,0 +1,7 @@
+# Self-signed test certificate files — never commit private keys
+client.key
+client.crt
+client.pfx
+*.tfvars
+terraform.tfstate*
+.terraform/

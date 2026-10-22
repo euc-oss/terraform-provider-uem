@@ -6,11 +6,11 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	sdk "github.com/euc-oss/terraform-sdk-uem"
-	"github.com/euc-oss/terraform-sdk-uem/client"
-
+	sdk "github.com/euc-oss/terraform-sdk-uem/v26"
+	"github.com/euc-oss/terraform-sdk-uem/v26/client"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/tfsdk"
+	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/hashicorp/terraform-plugin-go/tftypes"
 )
 
@@ -108,6 +108,22 @@ func createResourcePlan(t *testing.T, values map[string]tftypes.Value) tfsdk.Pla
 	}
 }
 
+// createResourceConfig creates a tfsdk.Config for resource testing (e.g.
+// exercising ValidateConfig, which receives a tfsdk.Config rather than a
+// tfsdk.Plan). Any attribute not provided is filled with a null value of
+// the correct type, mirroring createResourcePlan.
+func createResourceConfig(t *testing.T, values map[string]tftypes.Value) tfsdk.Config {
+	t.Helper()
+	schemaResp := getResourceSchema(t)
+	ctx := context.Background()
+	configType := schemaResp.Schema.Type().TerraformType(ctx)
+	configValue := tftypes.NewValue(configType, fillMissingAttrs(t, configType, values))
+	return tfsdk.Config{
+		Schema: schemaResp.Schema,
+		Raw:    configValue,
+	}
+}
+
 // createResourceState creates a tfsdk.State with provided values.
 func createResourceState(t *testing.T, values map[string]tftypes.Value) tfsdk.State {
 	t.Helper()
@@ -138,6 +154,24 @@ func emptyResourceState(t *testing.T) tfsdk.State {
 	return tfsdk.State{
 		Schema: schemaResp.Schema,
 		Raw:    tftypes.NewValue(schemaType, values),
+	}
+}
+
+// nullResourceState creates a tfsdk.State whose Raw is a genuine null of the
+// whole resource object type -- what the framework passes as the prior state
+// during Create (no resource instance exists yet). This is NOT the same as
+// emptyResourceState, whose Raw is a known object with every attribute set to
+// null: a plan modifier's "req.State.Raw.IsNull()" check (e.g.
+// boolplanmodifier/objectplanmodifier's UseStateForUnknown) is false for
+// emptyResourceState and true only for this helper's value.
+func nullResourceState(t *testing.T) tfsdk.State {
+	t.Helper()
+	schemaResp := getResourceSchema(t)
+	ctx := context.Background()
+	schemaType := schemaResp.Schema.Type().TerraformType(ctx)
+	return tfsdk.State{
+		Schema: schemaResp.Schema,
+		Raw:    tftypes.NewValue(schemaType, nil),
 	}
 }
 
@@ -208,6 +242,23 @@ func passcodeVal(vals map[string]tftypes.Value) tftypes.Value {
 
 func int64Val(n int64) tftypes.Value {
 	return tftypes.NewValue(tftypes.Number, n)
+}
+
+// stringListVal builds a tftypes list-of-string value, used for the
+// assigned_smart_groups / excluded_smart_groups attributes (each a list of
+// SmartGroup ID strings).
+func stringListVal(ids ...string) tftypes.Value {
+	listType := tftypes.List{ElementType: tftypes.String}
+	vals := make([]tftypes.Value, len(ids))
+	for i, id := range ids {
+		vals[i] = stringVal(id)
+	}
+	return tftypes.NewValue(listType, vals)
+}
+
+// nullStringList returns a null tftypes list-of-string value.
+func nullStringList() tftypes.Value {
+	return tftypes.NewValue(tftypes.List{ElementType: tftypes.String}, nil)
 }
 
 // customSettingsListItemType returns the tftypes type for a single custom_settings_list item.
@@ -508,6 +559,20 @@ func mcxVal(vals map[string]tftypes.Value) tftypes.Value {
 	return tftypes.NewValue(objType, defaults)
 }
 
+// mcxDestroyFVKeyOnStandby extracts the destroy_fv_key_on_standby leaf from a
+// disk_encryption.mcx types.Object for test assertions. DiskEncryptionModel.MCX
+// is a types.Object, not a *DiskEncryptionMCXModel pointer (B42 follow-up: a
+// pointer field cannot decode an unknown plan value), so tests read the leaf
+// out of the object's attribute map rather than a struct field.
+func mcxDestroyFVKeyOnStandby(t *testing.T, o types.Object) types.Bool {
+	t.Helper()
+	b, ok := o.Attributes()["destroy_fv_key_on_standby"].(types.Bool)
+	if !ok {
+		t.Fatal("mcx object missing destroy_fv_key_on_standby attribute")
+	}
+	return b
+}
+
 // --- Gatekeeper (Security & Privacy, macOS) test helpers ---
 
 func gatekeeperObjectType() tftypes.Object {
@@ -524,6 +589,25 @@ func gatekeeperObjectType() tftypes.Object {
 
 func nullGatekeeper() tftypes.Value {
 	return tftypes.NewValue(gatekeeperObjectType(), nil)
+}
+
+// gatekeeperVal builds a tftypes.Value for the gatekeeper attribute from
+// sub-values, defaulting any omitted field to null.
+func gatekeeperVal(vals map[string]tftypes.Value) tftypes.Value {
+	objType := gatekeeperObjectType()
+	defaults := map[string]tftypes.Value{
+		"allow_auto_unlock":                tftypes.NewValue(tftypes.Bool, nil),
+		"allow_fingerprint_for_unlock":     tftypes.NewValue(tftypes.Bool, nil),
+		"allow_handoff":                    tftypes.NewValue(tftypes.Bool, nil),
+		"allow_screen_capture":             tftypes.NewValue(tftypes.Bool, nil),
+		"enable_app_software_update_delay": tftypes.NewValue(tftypes.Bool, nil),
+		"enable_software_update_delay":     tftypes.NewValue(tftypes.Bool, nil),
+		"enforced_software_update_delay":   tftypes.NewValue(tftypes.Number, nil),
+	}
+	for k, v := range vals {
+		defaults[k] = v
+	}
+	return tftypes.NewValue(objType, defaults)
 }
 
 // --- Restrictions (macOS) test helpers ---
@@ -821,4 +905,48 @@ func restrictionsPreferencesVal(vals map[string]tftypes.Value) tftypes.Value {
 		defaults[k] = v
 	}
 	return tftypes.NewValue(restrictionsPreferencesType(), defaults)
+}
+
+// restrictionsMediaAccessVal builds a MediaAccess (allow/authenticate/read_only) sub-object with defaults.
+func restrictionsMediaAccessVal(vals map[string]tftypes.Value) tftypes.Value {
+	defaults := map[string]tftypes.Value{
+		"allow":        tftypes.NewValue(tftypes.Bool, nil),
+		"authenticate": tftypes.NewValue(tftypes.Bool, nil),
+		"read_only":    tftypes.NewValue(tftypes.Bool, nil),
+	}
+	for k, v := range vals {
+		defaults[k] = v
+	}
+	return tftypes.NewValue(restrictionsMediaAccessType(), defaults)
+}
+
+// restrictionsMediaVal builds a media sub-object with defaults.
+func restrictionsMediaVal(vals map[string]tftypes.Value) tftypes.Value {
+	defaults := map[string]tftypes.Value{
+		"auto_eject_media":                tftypes.NewValue(tftypes.Bool, nil),
+		"disk_media_cds":                  tftypes.NewValue(restrictionsMediaAccessType(), nil),
+		"disk_media_dvds":                 tftypes.NewValue(restrictionsMediaAccessType(), nil),
+		"external_hard_disk_media_access": tftypes.NewValue(restrictionsMediaAccessType(), nil),
+		"hard_disk_dvd_ram":               tftypes.NewValue(restrictionsMediaAccessType(), nil),
+		"hard_disk_images":                tftypes.NewValue(restrictionsMediaAccessType(), nil),
+		"internal_hard_disk_media_access": tftypes.NewValue(restrictionsMediaAccessType(), nil),
+		"network_access":                  tftypes.NewValue(restrictionsNetworkAccessType(), nil),
+		"recordable_disc":                 tftypes.NewValue(restrictionsBurnSupportType(), nil),
+	}
+	for k, v := range vals {
+		defaults[k] = v
+	}
+	return tftypes.NewValue(restrictionsMediaType(), defaults)
+}
+
+// restrictionsDesktopVal builds a desktop sub-object with defaults.
+func restrictionsDesktopVal(vals map[string]tftypes.Value) tftypes.Value {
+	defaults := map[string]tftypes.Value{
+		"desktop_picture_path": tftypes.NewValue(tftypes.String, nil),
+		"lock_desktop_picture": tftypes.NewValue(tftypes.Bool, nil),
+	}
+	for k, v := range vals {
+		defaults[k] = v
+	}
+	return tftypes.NewValue(restrictionsDesktopType(), defaults)
 }

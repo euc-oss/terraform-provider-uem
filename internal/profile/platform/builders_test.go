@@ -1,11 +1,12 @@
 package platform
 
 import (
+	"strings"
 	"testing"
 
 	profilemodels "github.com/euc-oss/terraform-provider-uem/internal/profile/models"
 
-	sdk "github.com/euc-oss/terraform-sdk-uem"
+	sdk "github.com/euc-oss/terraform-sdk-uem/v26"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 )
 
@@ -76,6 +77,14 @@ func TestBuildGeneralV2Create_NullsAndUnknownsOmitted(t *testing.T) {
 	}
 }
 
+// TestBuildGeneralV2Create_InvalidOrgGroupIDIgnored documents the builder's
+// own defense-in-depth behavior for a non-numeric org_group_id (it still
+// can't produce a valid int, so it omits the field rather than sending
+// garbage). internal-task: a known, non-numeric org_group_id is the real
+// gatekeeper's job -- profile.ProfileResource.ValidateConfig rejects it at
+// plan time (canonical rules 2026-09-25-canonical-264-general-ogid Q1:
+// General.ManagedLocationGroupID is a non-nullable int UEM expects on every
+// write), so this exact input should never reach the builder in practice.
 func TestBuildGeneralV2Create_InvalidOrgGroupIDIgnored(t *testing.T) {
 	t.Parallel()
 
@@ -121,6 +130,131 @@ func TestStampGeneralV2(t *testing.T) {
 			t.Errorf("Version = %v, want nil", *g.Version)
 		}
 	})
+}
+
+// --- V4 General builder (Linux) ---------------------------------------------
+
+func TestBuildGeneralV4Create_ProductionScope(t *testing.T) {
+	t.Parallel()
+
+	data := &profilemodels.ProfileResourceModel{
+		Name:           types.StringValue("Test Profile"),
+		Description:    types.StringValue("desc"),
+		AssignmentType: types.StringValue("Auto"),
+		ProfileScope:   types.StringValue("Production"),
+		IsActive:       types.BoolValue(true),
+		ProfileContext: types.StringValue("Device"),
+		OrgGroupID:     types.StringValue("14165"),
+	}
+
+	got, err := BuildGeneralV4Create(data)
+	if err != nil {
+		t.Fatalf("err = %v", err)
+	}
+	if got == nil {
+		t.Fatal("got nil")
+	}
+	if got.ProfileScope == nil || *got.ProfileScope != 1 {
+		t.Errorf("ProfileScope = %v, want *1", got.ProfileScope)
+	}
+	if got.Name != "Test Profile" {
+		t.Errorf("Name = %q", got.Name)
+	}
+}
+
+// TestBuildGeneralV4Create_OrgGroupIDSent verifies the V4 (Linux) General
+// builder never produces a nil ManagedLocationGroupID for a known, numeric
+// org_group_id, mirroring the V2 assertion in
+// TestBuildGeneralV2Create_AllFieldsKnown (internal-task, canonical rules
+// general-ogid Q1/Q2: the field is unconditionally sent, with no
+// platform-specific guard).
+func TestBuildGeneralV4Create_OrgGroupIDSent(t *testing.T) {
+	t.Parallel()
+
+	data := &profilemodels.ProfileResourceModel{
+		Name:         types.StringValue("Test Profile"),
+		ProfileScope: types.StringValue("Production"),
+		OrgGroupID:   types.StringValue("14165"),
+	}
+
+	got, err := BuildGeneralV4Create(data)
+	if err != nil {
+		t.Fatalf("err = %v", err)
+	}
+	if got.ManagedLocationGroupID == nil || *got.ManagedLocationGroupID != 14165 {
+		t.Errorf("ManagedLocationGroupID = %v, want *14165", got.ManagedLocationGroupID)
+	}
+}
+
+func TestBuildGeneralV4Create_UnmappedScope_Errors(t *testing.T) {
+	t.Parallel()
+
+	data := &profilemodels.ProfileResourceModel{
+		Name:         types.StringValue("Test Profile"),
+		ProfileScope: types.StringValue("Test"),
+	}
+
+	got, err := BuildGeneralV4Create(data)
+	if err == nil {
+		t.Fatal("expected error for unmapped ProfileScope value, got nil")
+	}
+	if got != nil {
+		t.Errorf("got = %+v, want nil on error", got)
+	}
+	if !strings.Contains(err.Error(), "Test") {
+		t.Errorf("error message = %q, want it to name the offending value %q", err.Error(), "Test")
+	}
+}
+
+func TestBuildGeneralV4Create_StagingScope(t *testing.T) {
+	t.Parallel()
+
+	data := &profilemodels.ProfileResourceModel{
+		Name:         types.StringValue("Test Profile"),
+		ProfileScope: types.StringValue("Staging"),
+	}
+
+	got, err := BuildGeneralV4Create(data)
+	if err != nil {
+		t.Fatalf("err = %v", err)
+	}
+	if got.ProfileScope == nil || *got.ProfileScope != 2 {
+		t.Errorf("ProfileScope = %v, want *2", got.ProfileScope)
+	}
+}
+
+func TestBuildGeneralV4Create_BothScope(t *testing.T) {
+	t.Parallel()
+
+	data := &profilemodels.ProfileResourceModel{
+		Name:         types.StringValue("Test Profile"),
+		ProfileScope: types.StringValue("Both"),
+	}
+
+	got, err := BuildGeneralV4Create(data)
+	if err != nil {
+		t.Fatalf("err = %v", err)
+	}
+	if got.ProfileScope == nil || *got.ProfileScope != 3 {
+		t.Errorf("ProfileScope = %v, want *3", got.ProfileScope)
+	}
+}
+
+func TestBuildGeneralV4Create_ScopeCaseInsensitive(t *testing.T) {
+	t.Parallel()
+
+	data := &profilemodels.ProfileResourceModel{
+		Name:         types.StringValue("Test Profile"),
+		ProfileScope: types.StringValue("staging"),
+	}
+
+	got, err := BuildGeneralV4Create(data)
+	if err != nil {
+		t.Fatalf("err = %v", err)
+	}
+	if got.ProfileScope == nil || *got.ProfileScope != 2 {
+		t.Errorf("ProfileScope = %v, want *2", got.ProfileScope)
+	}
 }
 
 // --- AppleOsX top-level entity ---------------------------------------------
@@ -247,6 +381,210 @@ func TestBuildAppleOsXCreateEntity_WithGatekeeper(t *testing.T) {
 	}
 	if ent.GateKeeper.AllowScreenCapture == nil || *ent.GateKeeper.AllowScreenCapture != false {
 		t.Errorf("AllowScreenCapture not propagated, got %v", ent.GateKeeper.AllowScreenCapture)
+	}
+}
+
+func TestBuildAppleOsXSystemExtensionsEntity_NullsOmitted(t *testing.T) {
+	t.Parallel()
+
+	m := &profilemodels.SystemExtensionsModel{
+		AllowUserOverrides: types.BoolNull(),
+	}
+	out := buildAppleOsXSystemExtensionsEntity(m)
+	if out == nil {
+		t.Fatal("expected non-nil entity")
+	}
+	if out.AllowUserOverrides != nil {
+		t.Errorf("AllowUserOverrides = %v, want nil", out.AllowUserOverrides)
+	}
+	if out.AllowedSystemExtensionTypes != nil {
+		t.Errorf("AllowedSystemExtensionTypes = %v, want nil (empty input list)", out.AllowedSystemExtensionTypes)
+	}
+	if out.AllowedSystemExtensions != nil {
+		t.Errorf("AllowedSystemExtensions = %v, want nil (empty input list)", out.AllowedSystemExtensions)
+	}
+}
+
+func TestBuildAppleOsXSystemExtensionsEntity_AllFieldsSet(t *testing.T) {
+	t.Parallel()
+
+	m := &profilemodels.SystemExtensionsModel{
+		AllowUserOverrides: types.BoolValue(false),
+		AllowedSystemExtensionTypes: []profilemodels.AllowedSystemExtensionTypeModel{
+			{
+				TeamIdentifier:                     types.StringValue("ABCDE12345"),
+				AllowDriverExtensionType:           types.BoolValue(true),
+				AllowEndpointSecurityExtensionType: types.BoolValue(false),
+				AllowNetworkExtensionType:          types.BoolValue(true),
+			},
+			{
+				TeamIdentifier: types.StringValue("*"),
+			},
+		},
+		AllowedSystemExtensions: []profilemodels.AllowedSystemExtensionModel{
+			{
+				BundleIdentifier: types.StringValue("com.example.extension"),
+				TeamIdentifier:   types.StringValue("ABCDE12345"),
+			},
+		},
+	}
+	out := buildAppleOsXSystemExtensionsEntity(m)
+	if out == nil {
+		t.Fatal("expected non-nil entity")
+	}
+	if out.AllowUserOverrides == nil || *out.AllowUserOverrides != false {
+		t.Errorf("AllowUserOverrides = %v, want false", out.AllowUserOverrides)
+	}
+	if len(out.AllowedSystemExtensionTypes) != 2 {
+		t.Fatalf("AllowedSystemExtensionTypes len = %d, want 2", len(out.AllowedSystemExtensionTypes))
+	}
+	first := out.AllowedSystemExtensionTypes[0]
+	if first.TeamIdentifier != "ABCDE12345" {
+		t.Errorf("AllowedSystemExtensionTypes[0].TeamIdentifier = %q, want %q", first.TeamIdentifier, "ABCDE12345")
+	}
+	if first.AllowDriverExtensionType == nil || !*first.AllowDriverExtensionType {
+		t.Errorf("AllowedSystemExtensionTypes[0].AllowDriverExtensionType = %v, want true", first.AllowDriverExtensionType)
+	}
+	if first.AllowEndpointSecurityExtensionType == nil || *first.AllowEndpointSecurityExtensionType {
+		t.Errorf("AllowedSystemExtensionTypes[0].AllowEndpointSecurityExtensionType = %v, want false", first.AllowEndpointSecurityExtensionType)
+	}
+	second := out.AllowedSystemExtensionTypes[1]
+	if second.TeamIdentifier != "*" {
+		t.Errorf("AllowedSystemExtensionTypes[1].TeamIdentifier = %q, want %q", second.TeamIdentifier, "*")
+	}
+	if len(out.AllowedSystemExtensions) != 1 {
+		t.Fatalf("AllowedSystemExtensions len = %d, want 1", len(out.AllowedSystemExtensions))
+	}
+	if out.AllowedSystemExtensions[0].BundleIdentifier != "com.example.extension" {
+		t.Errorf("AllowedSystemExtensions[0].BundleIdentifier = %q, want %q", out.AllowedSystemExtensions[0].BundleIdentifier, "com.example.extension")
+	}
+}
+
+func TestBuildAppleOsXCreateEntity_WithSystemExtensions(t *testing.T) {
+	t.Parallel()
+
+	data := &profilemodels.ProfileResourceModel{
+		Name: types.StringValue("WithSystemExtensions"),
+		SystemExtensions: &profilemodels.SystemExtensionsModel{
+			AllowUserOverrides: types.BoolValue(false),
+			AllowedSystemExtensions: []profilemodels.AllowedSystemExtensionModel{
+				{BundleIdentifier: types.StringValue("com.example.extension")},
+			},
+		},
+	}
+	ent, err := BuildAppleOsXCreateEntity(data)
+	if err != nil {
+		t.Fatalf("err = %v", err)
+	}
+	if ent.SystemExtensions == nil {
+		t.Fatal("SystemExtensions not propagated to entity")
+	}
+	if ent.SystemExtensions.AllowUserOverrides == nil || *ent.SystemExtensions.AllowUserOverrides != false {
+		t.Errorf("AllowUserOverrides not propagated, got %v", ent.SystemExtensions.AllowUserOverrides)
+	}
+	if len(ent.SystemExtensions.AllowedSystemExtensions) != 1 || ent.SystemExtensions.AllowedSystemExtensions[0].BundleIdentifier != "com.example.extension" {
+		t.Errorf("AllowedSystemExtensions not propagated, got %+v", ent.SystemExtensions.AllowedSystemExtensions)
+	}
+}
+
+// --- PrivacyPreferences (PPPC) builders -------------------------------------
+
+func TestBuildAppleOsXPrivacyPreferencesIdentities_EmptyInputIsNil(t *testing.T) {
+	t.Parallel()
+
+	if got := buildAppleOsXPrivacyPreferencesIdentities(nil); got != nil {
+		t.Errorf("got %+v, want nil", got)
+	}
+}
+
+func TestBuildAppleOsXPrivacyPreferenceIdentity_AllFieldsSet(t *testing.T) {
+	t.Parallel()
+
+	m := profilemodels.PrivacyPreferenceModel{
+		Identifier:      types.StringValue("com.example.app"),
+		IdentifierType:  types.StringValue("bundleID"),
+		CodeRequirement: types.StringValue("identifier \"com.example.app\""),
+		Comment:         types.StringValue("a rule"),
+		AppleEventsList: []profilemodels.AppleEventModel{
+			{
+				CodeRequirement: types.StringValue("cr"),
+				Identifier:      types.StringValue("com.example.receiver"),
+				IdentifierType:  types.StringValue("bundleID"),
+				Permission:      types.StringValue("Allow"),
+			},
+		},
+		StaticCode:           types.BoolValue(true),
+		Accessibility:        types.StringValue("Allow"),
+		Camera:               types.StringValue("Disallow"),
+		SystemPolicyAllFiles: types.StringValue("Allow"),
+		FileProviderPresence: types.StringValue("Allow"),
+		SpeechRecognition:    types.StringValue("Allow"),
+	}
+
+	got := buildAppleOsXPrivacyPreferenceIdentity(&m)
+	if got.Identifier != "com.example.app" {
+		t.Errorf("Identifier = %q, want %q", got.Identifier, "com.example.app")
+	}
+	if got.IdentifierType != "bundleID" {
+		t.Errorf("IdentifierType = %q, want %q", got.IdentifierType, "bundleID")
+	}
+	if got.StaticCode == nil || !*got.StaticCode {
+		t.Errorf("StaticCode = %v, want true", got.StaticCode)
+	}
+	if got.Camera != "Disallow" {
+		t.Errorf("Camera = %q, want %q", got.Camera, "Disallow")
+	}
+	if len(got.AppleEventsList) != 1 {
+		t.Fatalf("AppleEventsList len = %d, want 1", len(got.AppleEventsList))
+	}
+	if got.AppleEventsList[0].Identifier != "com.example.receiver" {
+		t.Errorf("AppleEventsList[0].Identifier = %q, want %q", got.AppleEventsList[0].Identifier, "com.example.receiver")
+	}
+	if got.AppleEventsList[0].Permission != "Allow" {
+		t.Errorf("AppleEventsList[0].Permission = %q, want %q", got.AppleEventsList[0].Permission, "Allow")
+	}
+	// UEM folds an identity-level Apple Events receiver into AppleEventsList
+	// on write (storing 2 identical entries when both forms are sent) and
+	// never repopulates the identity-level fields on read (canonical SDK
+	// answer). The builder must never set them -- apple_events_list is the
+	// only supported way to configure Apple Events.
+	if got.AEReceiverIdentifier != "" || got.AEReceiverIdentifierType != "" || got.AEReceiverCodeRequirement != "" {
+		t.Errorf("AEReceiver* = %q/%q/%q, want all empty (identity-level AE fields must never be sent)",
+			got.AEReceiverIdentifier, got.AEReceiverIdentifierType, got.AEReceiverCodeRequirement)
+	}
+	if got.AppleEvents != "" {
+		t.Errorf("AppleEvents = %q, want empty (coarse-grained field must never be sent)", got.AppleEvents)
+	}
+}
+
+func TestBuildAppleOsXCreateEntity_WithPrivacyPreferences(t *testing.T) {
+	t.Parallel()
+
+	data := &profilemodels.ProfileResourceModel{
+		Name: types.StringValue("WithPrivacyPreferences"),
+		PrivacyPreferences: []profilemodels.PrivacyPreferenceModel{
+			{
+				Identifier:     types.StringValue("com.example.app"),
+				IdentifierType: types.StringValue("bundleID"),
+				Camera:         types.StringValue("Disallow"),
+			},
+		},
+	}
+	ent, err := BuildAppleOsXCreateEntity(data)
+	if err != nil {
+		t.Fatalf("err = %v", err)
+	}
+	if ent.PrivacyPreferences == nil {
+		t.Fatal("PrivacyPreferences not propagated to entity")
+	}
+	if len(ent.PrivacyPreferences.Identities) != 1 {
+		t.Fatalf("Identities len = %d, want 1", len(ent.PrivacyPreferences.Identities))
+	}
+	if ent.PrivacyPreferences.Identities[0].Identifier != "com.example.app" {
+		t.Errorf("Identities[0].Identifier = %q, want %q", ent.PrivacyPreferences.Identities[0].Identifier, "com.example.app")
+	}
+	if ent.PrivacyPreferences.Identities[0].Camera != "Disallow" {
+		t.Errorf("Identities[0].Camera = %q, want %q", ent.PrivacyPreferences.Identities[0].Camera, "Disallow")
 	}
 }
 

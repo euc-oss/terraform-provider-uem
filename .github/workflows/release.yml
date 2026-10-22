@@ -25,8 +25,6 @@ jobs:
         with:
           go-version-file: 'go.mod'
           cache: true
-      - name: Configure Git for private modules
-        run: git config --global url."https://${{ secrets.GO_MODULES_TOKEN }}@github.com/".insteadOf "https://github.com/"
       - name: Import GPG key
         uses: crazy-max/ghaction-import-gpg@e89d40939c28e39f97cf32126055eeae86ba74ec # v6.3.0
         id: import_gpg
