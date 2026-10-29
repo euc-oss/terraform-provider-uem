@@ -5,16 +5,18 @@
 Manage Omnissa Workspace ONE UEM with Terraform: macOS applications, scripts, sensors and their assignments, update deployments, smart groups, and device profiles across platforms.
 
 > [!NOTE]
-> **26.2 beta is available.** The current release is **v26.2.0-beta.1**, for UEM 26.2. Its source is on the [`release/26.2.0-beta1`](https://github.com/euc-oss/terraform-provider-uem/tree/release/26.2.0-beta1) branch. `main` is not updated for beta releases.
+> **26.4 beta is available.** The current release is **v26.4.0-beta.1**, for UEM 26.4. Its source is on the [`release/26.4.0-beta1`](https://github.com/euc-oss/terraform-provider-uem/tree/release/26.4.0-beta1) branch. For UEM 26.2, use **v26.2.0-beta.1** from the [`release/26.2.0-beta1`](https://github.com/euc-oss/terraform-provider-uem/tree/release/26.2.0-beta1) branch. `main` is not updated for beta releases.
 
 ## Downloads
 
-Both are on the [Releases](https://github.com/euc-oss/terraform-provider-uem/releases) page:
+All are on the [Releases](https://github.com/euc-oss/terraform-provider-uem/releases) page:
 
 | Release | What it is |
 | --- | --- |
-| [**v26.2.0-beta.1**](https://github.com/euc-oss/terraform-provider-uem/releases/tag/v26.2.0-beta.1) | The `omnissa/uem` Terraform provider, as a mirror zip with an installer (macOS and Linux) |
-| [**ws1-tf v26.2.0-beta.1**](https://github.com/euc-oss/terraform-provider-uem/releases/tag/ws1-tf-v26.2.0-beta.1) | The `ws1-tf` CLI, which generates Terraform configuration from what already exists in your tenant and installs the provider for you |
+| [**v26.4.0-beta.1**](https://github.com/euc-oss/terraform-provider-uem/releases/tag/v26.4.0-beta.1) | The `omnissa/uem` Terraform provider for UEM 26.4, as a mirror zip with an installer (macOS and Linux) |
+| [**ws1-tf v26.4.0-beta.1**](https://github.com/euc-oss/terraform-provider-uem/releases/tag/ws1-tf-v26.4.0-beta.1) | The `ws1-tf` CLI for UEM 26.4, which generates Terraform configuration from what already exists in your tenant and installs the provider for you |
+| [**v26.2.0-beta.1**](https://github.com/euc-oss/terraform-provider-uem/releases/tag/v26.2.0-beta.1) | The `omnissa/uem` Terraform provider for UEM 26.2, as a mirror zip with an installer (macOS and Linux) |
+| [**ws1-tf v26.2.0-beta.1**](https://github.com/euc-oss/terraform-provider-uem/releases/tag/ws1-tf-v26.2.0-beta.1) | The `ws1-tf` CLI for UEM 26.2, which generates Terraform configuration from what already exists in your tenant and installs the provider for you |
 
 The provider is not on the Terraform Registry yet. The release notes describe how to install each one.
 
@@ -25,7 +27,7 @@ The provider is not on the Terraform Registry yet. The release notes describe ho
 - **Resources:** `uem_profile`, `uem_mac_application`, `uem_application_assignment`, `uem_purchased_application_assignment`, `uem_mac_script`, `uem_script_assignment`, `uem_mac_sensor`, `uem_sensor_assignment`, `uem_update_deployment`, `uem_smart_group`
 - **Data sources:** `uem_profiles`, `uem_applications`, `uem_mac_applications`, `uem_purchased_applications`, `uem_scripts`, `uem_sensors`, `uem_update_deployments`, `uem_smart_groups`, `uem_organization_groups`
 
-The full reference is in [`docs/`](https://github.com/euc-oss/terraform-provider-uem/tree/release/26.2.0-beta1/docs) on the release branch.
+The full reference is in [`docs/`](https://github.com/euc-oss/terraform-provider-uem/tree/release/26.4.0-beta1/docs) on the release branch.
 
 ## The `ws1-tf` CLI
 
@@ -37,7 +39,7 @@ The full reference is in [`docs/`](https://github.com/euc-oss/terraform-provider
 - `ws1-tf onboard`: generates configuration for the objects you pick, imports them, and confirms a clean `terraform plan`.
 - `ws1-tf refresh-local`: brings your local `.tf` files back in line after changes made in the console. It never writes to UEM.
 
-See the [ws1-tf guide](docs/cli/README.md) for details.
+See the [ws1-tf guide](https://github.com/euc-oss/terraform-provider-uem/tree/release/26.4.0-beta1/docs/cli) for details.
 
 ## Support
 
