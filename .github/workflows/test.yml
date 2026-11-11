@@ -34,8 +34,6 @@ jobs:
         with:
           go-version-file: 'go.mod'
           cache: true
-      - name: Configure Git for private modules
-        run: git config --global url."https://${{ secrets.GO_MODULES_TOKEN }}@github.com/".insteadOf "https://github.com/"
       - run: go mod download
       - run: go build -v .
       - name: Run linters
@@ -51,8 +49,6 @@ jobs:
         with:
           go-version-file: 'go.mod'
           cache: true
-      - name: Configure Git for private modules
-        run: git config --global url."https://${{ secrets.GO_MODULES_TOKEN }}@github.com/".insteadOf "https://github.com/"
       # We need the latest version of Terraform for our documentation generation to use
       - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
         with:
@@ -78,9 +74,6 @@ jobs:
         with:
           go-version-file: 'go.mod'
           cache: true
-
-      - name: Configure Git for private modules
-        run: git config --global url."https://${{ secrets.GO_MODULES_TOKEN }}@github.com/".insteadOf "https://github.com/"
 
       - name: Download dependencies
         run: go mod download
@@ -127,11 +120,8 @@ jobs:
           go-version-file: 'go.mod'
           cache: true
 
-      - name: Configure Git for private modules
-        run: git config --global url."https://${{ secrets.GO_MODULES_TOKEN }}@github.com/".insteadOf "https://github.com/"
-
       - name: Set up Terraform
-        uses: hashicorp/setup-terraform@v3
+        uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
         with:
           terraform_version: ${{ matrix.terraform }}
           terraform_wrapper: false
@@ -162,14 +152,11 @@ jobs:
           go-version-file: 'go.mod'
           cache: true
 
-      - name: Configure Git for private modules
-        run: git config --global url."https://${{ secrets.GO_MODULES_TOKEN }}@github.com/".insteadOf "https://github.com/"
-
       - name: Build and install provider locally
         run: make install
 
       - name: Set up Terraform
-        uses: hashicorp/setup-terraform@v3
+        uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
         with:
           terraform_wrapper: false
 

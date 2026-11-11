@@ -24,9 +24,6 @@ jobs:
           go-version-file: "go.mod"
           cache: true
 
-      - name: Configure Git for private modules
-        run: git config --global url."https://${{ secrets.GO_MODULES_TOKEN }}@github.com/".insteadOf "https://github.com/"
-
       - name: Download dependencies
         run: go mod download
 
@@ -40,7 +37,7 @@ jobs:
           go tool cover -html=coverage.out -o coverage.html
 
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v4
+        uses: codecov/codecov-action@b9fd7d16f6d7d1b5d2bec1a2887e65ceed900238 # v4.6.0
         with:
           file: ./coverage.out
           flags: unittests
